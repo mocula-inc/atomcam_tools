@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# hitonome
+#
+
+[ -f /media/mmc/mconfig ] || exit 0
+
+case "$1" in
+  start)
+    /scripts/hitonome.sh on &
+    ;;
+  stop)
+    /scripts/hitonome.sh off
+    ;;
+  restart|reload)
+    /scripts/hitonome.sh restart
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+esac
+
+exit $?
