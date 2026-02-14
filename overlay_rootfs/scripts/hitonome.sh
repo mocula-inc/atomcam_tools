@@ -1,6 +1,7 @@
-#!/bin/sh
+#!/bin/bash
 
 PIDFILE=/var/run/hitonome.pid
+DISABLEFILE=/var/run/hitonome.disabled
 LOGFILE=/tmp/log/hitonome.log
 MCONFIG=/media/mmc/mconfig
 
@@ -18,7 +19,7 @@ stop_daemon() {
 
 load_config() {
   eval $(awk -F "=" '
-    /^\[/ { section=$0; gsub(/[\[\]]/, "", section); next }
+    /^\[/ { section=$0; gsub(/\[/, "", section); gsub(/\]/, "", section); next }
     /^[a-zA-Z]/ { printf "%s_%s=%s\n", section, $1, $2 }
   ' $MCONFIG)
 
@@ -29,25 +30,27 @@ load_config() {
 
 fetch_camera_configs() {
   RESPONSE=$(curl --silent --max-time 30 \
-    "${API_ORIGIN}/api/tenants/${TENANT_KEY}/cameras/${CAMERA_KEY}/camera-configs")
+    "${API_ORIGIN}/api/v1/camera-configs/${TENANT_KEY}/${CAMERA_KEY}")
   if [ $? -ne 0 ] || [ -z "$RESPONSE" ]; then
     log "camera-configs fetch failed"
     return 1
   fi
   eval $(echo "$RESPONSE" | awk '{
-    gsub(/[{}"]/, "")
+    gsub(/[{}]/, ""); gsub(/\[/, ""); gsub(/\]/, ""); gsub(/"/, "")
     n = split($0, pairs, ",")
     for(i=1; i<=n; i++) {
-      split(pairs[i], kv, ":")
-      if(kv[1] == "isEnabled") printf "IS_ENABLED=%s\n", kv[2]
-      if(kv[1] == "checkInterval") printf "CHECK_INTERVAL=%s\n", kv[2]
+      m = split(pairs[i], kv, ":")
+      key = kv[m-1]
+      val = kv[m]
+      if(key == "isEnabled") printf "IS_ENABLED=%s\n", val
+      if(key == "checkInterval") printf "CHECK_INTERVAL=%s\n", val
     }
   }')
 }
 
 fetch_upload_urls() {
   RESPONSE=$(curl --silent --max-time 30 \
-    "${API_ORIGIN}/api/tenants/${TENANT_KEY}/cameras/${CAMERA_KEY}/upload-urls")
+    "${API_ORIGIN}/api/v1/upload-urls/${TENANT_KEY}/${CAMERA_KEY}")
   if [ $? -ne 0 ] || [ -z "$RESPONSE" ]; then
     log "upload-urls fetch failed"
     URL_QUEUE=""
@@ -66,10 +69,11 @@ capture_and_upload() {
     return 1
   fi
 
-  MSEC=$(awk 'NR==1{split($0,a," ");t=a[1]*100} NR==2{split($0,b,".");t+=b[1]*100+b[2]} END{print t}' /proc/stat /proc/uptime 2>/dev/null)
-  if [ -z "$MSEC" ]; then
-    MSEC=$(date +%s)000
-  fi
+  MSEC=$(awk '
+    FNR==NR && $1=="btime" {b=$2; next}
+    FNR==1 {u=$1}
+    END {printf "%.0f\n", (b+u)*1000}
+  ' /proc/stat /proc/uptime)
   SEC=$((MSEC / 1000))
   MS=$((MSEC % 1000))
   ISO_TIME="$(TZ=UTC date -d @$SEC +"%Y-%m-%dT%H:%M:%S")$(printf ".%03dZ" $MS)"
@@ -102,7 +106,6 @@ run_daemon() {
     exit 1
   fi
 
-  echo $$ > $PIDFILE
   log "hitonome started (pid=$$)"
 
   IS_ENABLED=false
@@ -151,20 +154,26 @@ run_daemon() {
 case "$1" in
   on)
     [ -f $MCONFIG ] || exit 0
+    rm -f $DISABLEFILE
     stop_daemon > /dev/null 2>&1
     run_daemon &
+    echo $! > $PIDFILE
     ;;
   off)
+    touch $DISABLEFILE
     stop_daemon
     log "hitonome stopped"
     ;;
   restart)
+    rm -f $DISABLEFILE
     stop_daemon
     [ -f $MCONFIG ] || exit 0
     run_daemon &
+    echo $! > $PIDFILE
     ;;
   watchdog)
     [ -f $MCONFIG ] || exit 0
+    [ -f $DISABLEFILE ] && exit 0
     if [ -f $PIDFILE ]; then
       PID=$(cat $PIDFILE)
       if kill -0 "$PID" > /dev/null 2>&1; then
@@ -173,6 +182,7 @@ case "$1" in
     fi
     log "watchdog: restarting hitonome"
     run_daemon &
+    echo $! > $PIDFILE
     ;;
   *)
     echo "Usage: $0 {on|off|restart|watchdog}"

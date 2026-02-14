@@ -8,4 +8,11 @@ if [ "$PS1" ]; then
 	fi
 fi
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+alias ls="ls -F --color=auto"
+alias la="ls -A"
+alias ll="ls -l"
+alias cp="cp -i"
+alias mv="mv -i"
+alias rm="rm -i"
+
 umask 022
