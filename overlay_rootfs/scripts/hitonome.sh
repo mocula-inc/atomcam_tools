@@ -14,7 +14,10 @@ stop_daemon() {
     kill $(cat $PIDFILE) > /dev/null 2>&1
     rm -f $PIDFILE
   fi
-  killall hitonome.sh > /dev/null 2>&1
+  # killall は自スクリプトも巻き込むため、自PID($$)を除外して個別に kill する
+  for pid in $(ps | awk -v mypid=$$ '/hitonome\.sh/ && $1 != mypid {print $1}'); do
+    kill "$pid" > /dev/null 2>&1
+  done
 }
 
 load_config() {
@@ -28,11 +31,39 @@ load_config() {
   CAMERA_KEY="$global_cameraKey"
 }
 
-fetch_camera_configs() {
+collect_device_info() {
+  WIFI_SSID=$(wpa_cli -i wlan0 status 2>/dev/null | grep '^ssid=' | cut -d= -f2)
+  WIFI_RSSI=$(awk '/wlan0/ {print int($4)}' /proc/net/wireless 2>/dev/null)
+  IP_ADDR=$(ifconfig wlan0 2>/dev/null | grep 'inet addr' | awk '{print $2}' | cut -d: -f2)
+  IP_MASK=$(ifconfig wlan0 2>/dev/null | grep 'inet addr' | awk '{print $4}' | cut -d: -f2)
+  TIMESTAMP=$(awk '
+    FNR==NR && $1=="btime" {b=$2; next}
+    FNR==1 {u=$1}
+    END {printf "%.0f\n", (b+u)*1000}
+  ' /proc/stat /proc/uptime)
+}
+
+camera_sync() {
+  collect_device_info
   RESPONSE=$(curl --silent --max-time 30 \
-    "${API_ORIGIN}/api/v1/camera-configs/${TENANT_KEY}/${CAMERA_KEY}")
-  if [ $? -ne 0 ] || [ -z "$RESPONSE" ]; then
-    log "camera-configs fetch failed"
+    -X POST -H 'Content-Type: application/json' \
+    -d "$(printf '{"wifi":{"ssid":"%s","rssi":%s},"ip":{"address":"%s","netmask":"%s"},"timestamp":%s}' \
+      "$WIFI_SSID" "${WIFI_RSSI:-0}" "$IP_ADDR" "$IP_MASK" "$TIMESTAMP")" \
+    "${API_ORIGIN}/api/v1/camera-sync/${TENANT_KEY}/${CAMERA_KEY}")
+  CURL_EXIT=$?
+  if [ $CURL_EXIT -ne 0 ]; then
+    log "camera-sync failed: curl error $CURL_EXIT"
+    URL_QUEUE=""
+    return 1
+  fi
+  if [ -z "$RESPONSE" ]; then
+    log "camera-sync failed: empty response"
+    URL_QUEUE=""
+    return 1
+  fi
+  if ! echo "$RESPONSE" | grep -q '"success":true'; then
+    log "camera-sync failed: $(echo "$RESPONSE" | cut -c1-200)"
+    URL_QUEUE=""
     return 1
   fi
   eval $(echo "$RESPONSE" | awk '{
@@ -46,17 +77,7 @@ fetch_camera_configs() {
       if(key == "checkInterval") printf "CHECK_INTERVAL=%s\n", val
     }
   }')
-}
-
-fetch_upload_urls() {
-  RESPONSE=$(curl --silent --max-time 30 \
-    "${API_ORIGIN}/api/v1/upload-urls/${TENANT_KEY}/${CAMERA_KEY}")
-  if [ $? -ne 0 ] || [ -z "$RESPONSE" ]; then
-    log "upload-urls fetch failed"
-    URL_QUEUE=""
-    return 1
-  fi
-  URL_QUEUE=$(echo "$RESPONSE" | sed 's/.*\[//; s/\].*//; s/"//g' | tr ',' '\n')
+  URL_QUEUE=$(echo "$RESPONSE" | sed 's/.*"uploadUrls":\[//; s/\].*//; s/"//g' | tr ',' '\n')
 }
 
 next_upload_url() {
@@ -74,8 +95,9 @@ capture_and_upload() {
     FNR==1 {u=$1}
     END {printf "%.0f\n", (b+u)*1000}
   ' /proc/stat /proc/uptime)
-  SEC=$((MSEC / 1000))
-  MS=$((MSEC % 1000))
+  # $((MSEC / 1000)) は 32bit 算術でオーバーフローするため awk で計算する
+  SEC=$(awk "BEGIN{printf \"%d\", $MSEC/1000}")
+  MS=$(awk "BEGIN{printf \"%d\", $MSEC%1000}")
   ISO_TIME="$(TZ=UTC date -d @$SEC +"%Y-%m-%dT%H:%M:%S")$(printf ".%03dZ" $MS)"
 
   TMPDIR=$(mktemp -d)
@@ -89,10 +111,13 @@ capture_and_upload() {
   printf '[{"filename":"%s.jpg","capturedAt":"%s"}]' "$MSEC" "$ISO_TIME" > "$TMPDIR/contents.json"
   tar -C "$TMPDIR" -cf "$TMPDIR/tarball.tar" "${MSEC}.jpg" contents.json
 
-  curl -X PUT -H 'Content-Type: application/tar' --max-time 30 --silent \
-    "$UPLOAD_URL" --data-binary @"$TMPDIR/tarball.tar"
-  if [ $? -ne 0 ]; then
-    log "upload failed: $UPLOAD_URL"
+  HTTP_CODE=$(curl -X PUT -H 'Content-Type: application/tar' --max-time 30 --silent \
+    --output "$TMPDIR/upload_response.txt" --write-out "%{http_code}" \
+    "$UPLOAD_URL" --data-binary @"$TMPDIR/tarball.tar")
+  CURL_EXIT=$?
+  if [ $CURL_EXIT -ne 0 ] || [ "$HTTP_CODE" != "200" ]; then
+    BODY=$(cut -c1-200 "$TMPDIR/upload_response.txt" 2>/dev/null)
+    log "upload failed: curl=$CURL_EXIT HTTP=$HTTP_CODE $BODY"
   fi
   rm -rf "$TMPDIR"
 }
@@ -115,33 +140,19 @@ run_daemon() {
   URL_QUEUE=""
 
   while true; do
-    # Fetch camera-configs every 60 seconds
+    # Sync with server every 60 seconds
     if [ $CONFIG_COUNTER -ge 60 ] || [ $CONFIG_COUNTER -eq 0 ]; then
-      fetch_camera_configs
+      camera_sync
       CONFIG_COUNTER=0
+      UPLOAD_COUNTER=0
     fi
 
     if [ "$IS_ENABLED" = "true" ]; then
-      if [ "$CHECK_INTERVAL" -le 60 ] 2>/dev/null; then
-        # Fast mode: fetch URLs every 60s, upload every checkInterval
-        if [ $UPLOAD_COUNTER -ge 60 ] || [ -z "$URL_QUEUE" -a $UPLOAD_COUNTER -eq 0 ]; then
-          fetch_upload_urls
-          [ $UPLOAD_COUNTER -ge 60 ] && UPLOAD_COUNTER=0
-        fi
-        if [ $((UPLOAD_COUNTER % CHECK_INTERVAL)) -eq 0 ] && [ -n "$URL_QUEUE" ]; then
-          next_upload_url
-          capture_and_upload
-        fi
-      else
-        # Slow mode: fetch URL and upload together every checkInterval
-        if [ $UPLOAD_COUNTER -ge "$CHECK_INTERVAL" ] || [ $UPLOAD_COUNTER -eq 0 ]; then
-          fetch_upload_urls
-          if [ -n "$URL_QUEUE" ]; then
-            next_upload_url
-            capture_and_upload
-          fi
-          UPLOAD_COUNTER=0
-        fi
+      # TODO: pre-signed URL の有効期限は 60 秒。CHECK_INTERVAL や URL 数の組み合わせ次第では
+      #       camera_sync 取得後のアップロードが期限切れになるリスクがある。
+      if [ $((UPLOAD_COUNTER % CHECK_INTERVAL)) -eq 0 ] && [ -n "$URL_QUEUE" ]; then
+        next_upload_url
+        capture_and_upload
       fi
     fi
 
