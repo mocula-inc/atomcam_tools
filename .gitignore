@@ -9,3 +9,6 @@ atomcam_tools.zip
 *.log
 bin/
 
+/.history/
+/atomcam_tools/
+/tmp/
