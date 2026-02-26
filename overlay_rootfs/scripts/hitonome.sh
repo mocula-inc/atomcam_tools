@@ -62,7 +62,7 @@ camera_sync() {
     return 1
   fi
   if ! echo "$RESPONSE" | grep -q '"success":true'; then
-    log "camera-sync failed: $(echo "$RESPONSE" | cut -c1-200)"
+    log "camera-sync failed: $RESPONSE"
     URL_QUEUE=""
     return 1
   fi
@@ -101,7 +101,7 @@ capture_and_upload() {
   ISO_TIME="$(TZ=UTC date -d @$SEC +"%Y-%m-%dT%H:%M:%S")$(printf ".%03dZ" $MS)"
 
   TMPDIR=$(mktemp -d)
-  /scripts/cmd jpeg | sed '1,3d' > "$TMPDIR/${MSEC}.jpg"
+  /scripts/cmd jpeg 1 | sed '1,3d' > "$TMPDIR/${MSEC}.jpg"  # ch1: サブストリーム 640x360
   if [ ! -s "$TMPDIR/${MSEC}.jpg" ]; then
     log "JPEG capture failed"
     rm -rf "$TMPDIR"
@@ -116,7 +116,7 @@ capture_and_upload() {
     "$UPLOAD_URL" --data-binary @"$TMPDIR/tarball.tar")
   CURL_EXIT=$?
   if [ $CURL_EXIT -ne 0 ] || [ "$HTTP_CODE" != "200" ]; then
-    BODY=$(cut -c1-200 "$TMPDIR/upload_response.txt" 2>/dev/null)
+    BODY=$(cat "$TMPDIR/upload_response.txt" 2>/dev/null)
     log "upload failed: curl=$CURL_EXIT HTTP=$HTTP_CODE $BODY"
   fi
   rm -rf "$TMPDIR"
