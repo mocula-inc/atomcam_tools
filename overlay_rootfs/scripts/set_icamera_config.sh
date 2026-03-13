@@ -49,3 +49,13 @@ fi
 [ "$BITRATE_SUB_HEVC" = "" ] || [ "$BITRATE_SUB_HEVC" -le 0 ] || /scripts/cmd video bitrate 1 $BITRATE_SUB_HEVC > /dev/null
 [ "$BITRATE_MAIN_HEVC" = "" ] || [ "$BITRATE_MAIN_HEVC" -le 0 ] || /scripts/cmd video bitrate 3 $BITRATE_MAIN_HEVC > /dev/null
 
+# モーション検知 OFF
+/scripts/cmd property motionDet off
+# 音声検知 OFF
+/scripts/cmd property soundDet off
+# 警報機音検知 OFF
+/scripts/cmd property cautionDet off
+# 検知ボックス描画 OFF
+/scripts/cmd property drawBoxSwitch off
+# 録画モード OFF
+/scripts/cmd property recordType off

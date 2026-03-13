@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# hitonome
+# mocula
 #
 
 [ -f /media/mmc/mconfig ] || exit 0
@@ -10,13 +10,13 @@ case "$1" in
     # iCamera_app が /tmp/resolv.conf を上書きするため、udhcpc に RENEW を送って DNS を復元する
     kill -USR1 $(pgrep udhcpc) > /dev/null 2>&1
     sleep 1
-    /scripts/hitonome.sh on &
+    /scripts/mocula.sh on &
     ;;
   stop)
-    /scripts/hitonome.sh off
+    /scripts/mocula.sh off
     ;;
   restart|reload)
-    /scripts/hitonome.sh restart
+    /scripts/mocula.sh restart
     ;;
   *)
     echo "Usage: $0 {start|stop|restart}"

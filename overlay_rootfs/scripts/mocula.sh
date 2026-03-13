@@ -1,8 +1,8 @@
 #!/bin/bash
 
-PIDFILE=/var/run/hitonome.pid
-DISABLEFILE=/var/run/hitonome.disabled
-LOGFILE=/tmp/log/hitonome.log
+PIDFILE=/var/run/mocula.pid
+DISABLEFILE=/var/run/mocula.disabled
+LOGFILE=/tmp/log/mocula.log
 MCONFIG=/media/mmc/mconfig
 
 log() {
@@ -15,7 +15,7 @@ stop_daemon() {
     rm -f $PIDFILE
   fi
   # killall は自スクリプトも巻き込むため、自PID($$)を除外して個別に kill する
-  for pid in $(ps | awk -v mypid=$$ '/hitonome\.sh/ && $1 != mypid {print $1}'); do
+  for pid in $(ps | awk -v mypid=$$ '/mocula\.sh/ && $1 != mypid {print $1}'); do
     kill "$pid" > /dev/null 2>&1
   done
 }
@@ -26,7 +26,7 @@ load_config() {
     /^[a-zA-Z]/ { printf "%s_%s=%s\n", section, $1, $2 }
   ' $MCONFIG)
 
-  API_ORIGIN="${dev_apiOrigin:-https://hitonome.cloud}"
+  API_ORIGIN="${global_origin:-https://app.mocula.jp}"
   TENANT_KEY="$global_tenantKey"
   CAMERA_KEY="$global_cameraKey"
 }
@@ -131,7 +131,7 @@ run_daemon() {
     exit 1
   fi
 
-  log "hitonome started (pid=$$)"
+  log "mocula started (pid=$$)"
 
   IS_ENABLED=false
   CHECK_INTERVAL=60
@@ -173,7 +173,7 @@ case "$1" in
   off)
     touch $DISABLEFILE
     stop_daemon
-    log "hitonome stopped"
+    log "mocula stopped"
     ;;
   restart)
     rm -f $DISABLEFILE
@@ -191,7 +191,7 @@ case "$1" in
         exit 0
       fi
     fi
-    log "watchdog: restarting hitonome"
+    log "watchdog: restarting mocula"
     run_daemon &
     echo $! > $PIDFILE
     ;;
