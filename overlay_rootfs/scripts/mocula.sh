@@ -32,6 +32,41 @@ log_fw() {
   echo "$(date +"%Y/%m/%d %H:%M:%S") : mocula.sh: $*" >> $FWLOGFILE 2>/dev/null
 }
 
+log_debug() {
+  [ "$DEBUG_MODE" = "1" ] || return 0
+  echo "$(date +"%Y/%m/%d %H:%M:%S") : [DEBUG] $*" >> $LOGFILE
+}
+
+camera_sync_save_error() {
+  FAIL_TYPE="$1"
+  FAIL_DETAIL="$2"
+  SYNC_FAIL_COUNT=$((SYNC_FAIL_COUNT + 1))
+  ERROR_DIR=/media/mmc/errors
+  [ -d /media/mmc ] || return 0
+  mkdir -p "$ERROR_DIR"
+
+  ROUTER=$(cat /tmp/router_address 2>/dev/null)
+  BOOT_TIME=$(awk '/^btime/ {print $2}' /proc/stat)
+  BOOT_TIME_STR=$(date -d @$BOOT_TIME +"%Y/%m/%d %H:%M:%S")
+  cat > "$ERROR_DIR/error-status.txt" << EOF
+=== Mocula camera-sync error ===
+Boot time        : $BOOT_TIME_STR
+Error time       : $(date +"%Y/%m/%d %H:%M:%S")
+Type             : $FAIL_TYPE
+Detail           : $FAIL_DETAIL
+Consecutive fails: $SYNC_FAIL_COUNT
+WiFi SSID        : ${WIFI_SSID:-(unknown)}
+WiFi RSSI        : ${WIFI_RSSI:-(unknown)}
+WiFi MAC         : ${WIFI_MAC:-(unknown)}
+IP Address       : ${IP_ADDR:-(unknown)}
+Default Gateway  : ${ROUTER:-(unknown)}
+API origin       : ${API_ORIGIN:-(unknown)}
+EOF
+
+  [ -f "$LOGFILE" ] && cp "$LOGFILE" "$ERROR_DIR/mocula.log"
+  [ -f /media/mmc/healthcheck.log ] && cp /media/mmc/healthcheck.log "$ERROR_DIR/healthcheck.log"
+}
+
 stop_daemon() {
   if [ -f $PIDFILE ]; then
     kill $(cat $PIDFILE) > /dev/null 2>&1
@@ -76,6 +111,7 @@ collect_device_info() {
   IP_ADDR=$(ifconfig wlan0 2>/dev/null | grep 'inet addr' | awk '{print $2}' | cut -d: -f2)
   IP_MASK=$(ifconfig wlan0 2>/dev/null | grep 'inet addr' | awk '{print $4}' | cut -d: -f2)
   TIMESTAMP=$(current_epoch_ms)
+  log_debug "collect_device_info: ssid=$WIFI_SSID rssi=$WIFI_RSSI mac=$WIFI_MAC ip=$IP_ADDR mask=$IP_MASK ts=$TIMESTAMP"
 }
 
 build_firmware_update_report() {
@@ -142,6 +178,7 @@ camera_sync() {
   [ -n "$FW_CURRENT" ] && FW_VERSION_JSON=$(printf ',"firmwareVersion":"%s"' "$FW_CURRENT")
   build_firmware_update_report
 
+  log_debug "camera_sync: POST ${API_ORIGIN}/api/v1/camera-sync/${TENANT_KEY}/${CAMERA_KEY}"
   SYNC_REQUEST_MS=$(current_epoch_ms)
   RESPONSE=$(curl --silent --max-time 30 \
     -X POST -H 'Content-Type: application/json' \
@@ -154,27 +191,32 @@ camera_sync() {
   # 差は小さい値だが、両オペランドはエポックミリ秒(32bit算術ではオーバーフローする桁数)
   # なので他の時刻計算と同様に awk で引き算する。
   RTT_MS=$(awk "BEGIN{printf \"%.0f\", $SYNC_RESPONSE_MS - $SYNC_REQUEST_MS}")
+  log_debug "camera_sync: curl_exit=$CURL_EXIT response_len=${#RESPONSE}"
   # sync 失敗時、まだ消化していない URL_QUEUE はそのまま残す(有効期限内の
   # pre-signed URL であり、この sync が失敗したことと無関係に使える)。
   # NEW_URL_QUEUE だけクリアして、直前の成功時の値を誤って合流させない。
   if [ $CURL_EXIT -ne 0 ]; then
     log "camera-sync failed: curl error $CURL_EXIT"
+    camera_sync_save_error "curl_error" "exit_code=$CURL_EXIT"
     NEW_URL_QUEUE=""
     FW_URL=""
     return 1
   fi
   if [ -z "$RESPONSE" ]; then
     log "camera-sync failed: empty response"
+    camera_sync_save_error "empty_response" "(no body)"
     NEW_URL_QUEUE=""
     FW_URL=""
     return 1
   fi
   if ! echo "$RESPONSE" | grep -q '"success":true'; then
     log "camera-sync failed: $RESPONSE"
+    camera_sync_save_error "bad_response" "$RESPONSE"
     NEW_URL_QUEUE=""
     FW_URL=""
     return 1
   fi
+  SYNC_FAIL_COUNT=0
 
   touch "$SYNC_OK_FILE"
   # 障害/ロールバック報告がサーバに届いたことが確認できたので、再試行ガードのstateを消す
@@ -194,6 +236,8 @@ camera_sync() {
       if(key == "checkInterval") printf "CHECK_INTERVAL=%s\n", val
       if(key == "firstUploadDelay") printf "FIRST_UPLOAD_DELAY=%s\n", val
       if(key == "serverEpoch") printf "SERVER_EPOCH=%s\n", val
+      if(key == "uptimeStart") printf "UPTIME_START=%s\n", val
+      if(key == "uptimeEnd") printf "UPTIME_END=%s\n", val
     }
   }')
   # firstUploadDelay を返さない旧サーバとの互換のため、未取得なら即時アップロード
@@ -202,6 +246,7 @@ camera_sync() {
   # run_daemon 側で URL_QUEUE への合流方法(上書きか追記か)を判断するため、
   # ここでは直接 URL_QUEUE を書き換えない
   NEW_URL_QUEUE=$(echo "$RESPONSE" | sed 's/.*"uploadUrls":\[//; s/\].*//; s/"//g' | tr ',' '\n')
+  log_debug "camera_sync: isEnabled=$IS_ENABLED checkInterval=$CHECK_INTERVAL urlCount=$(echo "$NEW_URL_QUEUE" | grep -c .)"
   parse_firmware_update_offer
   sync_clock_from_server
 }
@@ -215,6 +260,7 @@ capture_and_upload() {
   if [ -z "$UPLOAD_URL" ]; then
     return 1
   fi
+  log_debug "capture_and_upload: url=$UPLOAD_URL"
 
   MSEC=$(current_epoch_ms)
   # $((MSEC / 1000)) は 32bit 算術でオーバーフローするため awk で計算する
@@ -229,6 +275,7 @@ capture_and_upload() {
     rm -rf "$TMPDIR"
     return 1
   fi
+  log_debug "capture_and_upload: jpeg_size=$(wc -c < "$TMPDIR/${MSEC}.jpg") bytes"
 
   printf '[{"filename":"%s.jpg","capturedAt":"%s"}]' "$MSEC" "$ISO_TIME" > "$TMPDIR/contents.json"
   tar -C "$TMPDIR" -cf "$TMPDIR/tarball.tar" "${MSEC}.jpg" contents.json
@@ -237,6 +284,7 @@ capture_and_upload() {
     --output "$TMPDIR/upload_response.txt" --write-out "%{http_code}" \
     "$UPLOAD_URL" --data-binary @"$TMPDIR/tarball.tar")
   CURL_EXIT=$?
+  log_debug "capture_and_upload: http_code=$HTTP_CODE curl_exit=$CURL_EXIT"
   if [ $CURL_EXIT -ne 0 ] || [ "$HTTP_CODE" != "200" ]; then
     BODY=$(cat "$TMPDIR/upload_response.txt" 2>/dev/null)
     log "upload failed: curl=$CURL_EXIT HTTP=$HTTP_CODE $BODY"
@@ -399,6 +447,7 @@ backup_current_firmware() {
 run_daemon() {
   [ -f $MCONFIG ] || exit 0
   load_config
+  DEBUG_MODE="${global_debug:-0}"
 
   if [ -z "$TENANT_KEY" ] || [ -z "$CAMERA_KEY" ]; then
     log "tenantKey or cameraKey not configured"
@@ -406,6 +455,9 @@ run_daemon() {
   fi
 
   log "mocula started (pid=$$)"
+  log_debug "config: origin=$API_ORIGIN tenantKey=$TENANT_KEY cameraKey=$CAMERA_KEY"
+  WIFI_MAC=$(cat /sys/class/net/wlan0/address 2>/dev/null)
+  [ -n "$WIFI_MAC" ] && echo "$WIFI_MAC" > /media/mmc/mac-addr.txt
 
   IS_ENABLED=false
   CHECK_INTERVAL=60
@@ -413,10 +465,14 @@ run_daemon() {
   FIRST_UPLOAD_DELAY=0
   UPLOAD_TIMER=0
   URL_QUEUE=""
+  UPTIME_START=""
+  UPTIME_END=""
+  SYNC_FAIL_COUNT=0
 
   while true; do
     # Sync with server every 60 seconds
     if [ $CONFIG_COUNTER -ge 60 ] || [ $CONFIG_COUNTER -eq 0 ]; then
+      log_debug "loop: triggering camera_sync (config_counter=$CONFIG_COUNTER)"
       camera_sync
       CONFIG_COUNTER=0
       if [ -n "$URL_QUEUE" ]; then
@@ -442,12 +498,25 @@ ${NEW_URL_QUEUE}"
       apply_firmware_update
     fi
 
-    if [ "$IS_ENABLED" = "true" ] && [ -n "$URL_QUEUE" ] && [ "$UPLOAD_TIMER" -le 0 ]; then
-      next_upload_url
-      capture_and_upload
-      # checkInterval <= 60 の場合、1回の sync で複数本の URL が配られる。
-      # 2本目以降は checkInterval 秒ごとに均等に消化する。
-      UPLOAD_TIMER=$CHECK_INTERVAL
+    if [ "$IS_ENABLED" = "true" ]; then
+      # UPTIME_START と UPTIME_END の両方が設定されている場合、現在の uptime がその範囲内にあるときのみアップロードする
+      if [ -n "$UPTIME_START" ] && [ -n "$UPTIME_END" ]; then
+        NOW_HMS_NUM=$(expr $(date +"%H%m%S") + 0)
+        if [ $NOW_HMS_NUM -lt $(expr $UPTIME_START + 0) ] || [ $NOW_HMS_NUM -gt $(expr $UPTIME_END + 0) ]; then
+          sleep 1
+          CONFIG_COUNTER=$((CONFIG_COUNTER + 1))
+          UPLOAD_TIMER=$((UPLOAD_TIMER - 1))
+          continue
+        fi
+      fi
+      if [ -n "$URL_QUEUE" ] && [ "$UPLOAD_TIMER" -le 0 ]; then
+        log_debug "loop: triggering upload (upload_timer=$UPLOAD_TIMER check_interval=$CHECK_INTERVAL)"
+        next_upload_url
+        capture_and_upload
+        # checkInterval <= 60 の場合、1回の sync で複数本の URL が配られる。
+        # 2本目以降は checkInterval 秒ごとに均等に消化する。
+        UPLOAD_TIMER=$CHECK_INTERVAL
+      fi
     fi
 
     sleep 1
@@ -463,9 +532,11 @@ case "$1" in
     stop_daemon > /dev/null 2>&1
     run_daemon &
     echo $! > $PIDFILE
+    /scripts/mocula_live.sh on > /dev/null 2>&1
     ;;
   off)
     touch $DISABLEFILE
+    /scripts/mocula_live.sh off > /dev/null 2>&1
     stop_daemon
     log "mocula stopped"
     ;;
@@ -475,10 +546,12 @@ case "$1" in
     [ -f $MCONFIG ] || exit 0
     run_daemon &
     echo $! > $PIDFILE
+    /scripts/mocula_live.sh restart > /dev/null 2>&1
     ;;
   watchdog)
     [ -f $MCONFIG ] || exit 0
     [ -f $DISABLEFILE ] && exit 0
+    /scripts/mocula_live.sh watchdog > /dev/null 2>&1
     if [ -f $PIDFILE ]; then
       PID=$(cat $PIDFILE)
       if kill -0 "$PID" > /dev/null 2>&1; then
