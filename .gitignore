@@ -12,3 +12,4 @@ bin/
 /.history/
 /atomcam_tools/
 /tmp/
+*.zip

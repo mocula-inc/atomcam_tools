@@ -51,3 +51,6 @@ firmware-register:
 # 参考として残してある（synth の動作確認用）
 firmware-cdk-synth:
 	cd cdk && npm install && npx cdk synth --context config=$(CONFIG)
+
+push:
+	./utils.sh push
