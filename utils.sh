@@ -8,7 +8,7 @@ case "${1:-}" in
       echo "Error: No zip files found in dist/. Please run 'make zip' first."
       exit 1
     fi
-    if [ "${BUCKET}" == "" ]; then
+    if [ -z "${BUCKET:-}" ]; then
       echo "Error: BUCKET variable is not set."
       exit 1
     fi

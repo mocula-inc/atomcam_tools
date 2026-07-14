@@ -5,7 +5,7 @@
 ブラウザからネットワークカメラの映像をリアルタイムに閲覧する機能の仕様。  
 カメラは NAT 内ネットワークにあり、バックエンドへのアウトバウンド HTTPS のみ可能なため、シグナリングはバックエンド経由のロングポーリングで行う。
 
-**P2P 成立時**: go2rtc を介した H.264 WebRTC ストリーム（ハードウェアエンコード済み、640×360）  
+**P2P 成立時**: go2rtc を介した H.264 WebRTC ストリーム（ハードウェアエンコード済み、1920×1080）  
 **P2P 不成立時**: 5 秒おきの JPEG 静止画をバックエンド経由でブラウザに配信
 
 ---
@@ -69,12 +69,12 @@ ANSWERED       ──── タイムアウト (~25s) ────────�
 
 ### `POST /api/v1/live-signal/{tenantKey}/{cameraKey}/poll`
 
-カメラが定期的に呼ぶロングポーリングエンドポイント。バックエンドはアクションが発生するまで最大 50 秒保留する。
+カメラが定期的に呼ぶロングポーリングエンドポイント。バックエンドはアクションが発生するまで保留する（実装では最大 25 秒で 204 を返し、カメラはそのまま再 poll する）。カメラ側の待機上限は `live_pollTimeout`（既定 55 秒）。
 
 **リクエストボディ** (application/json):
 ```json
 {
-  "state": "idle | streaming | image",
+  "state": "idle | streaming",
   "consumers": 0
 }
 ```
@@ -234,10 +234,10 @@ function startImageFallback(cameraId, reason) {
 
 | エンドポイント | 用途 |
 |--------------|------|
-| `stun:stun.l.google.com:19302` | カメラ側（go2rtc に組み込み、変更不可） |
+| `stun:stun.l.google.com:19302` | カメラ側（mocula_live.sh が生成する go2rtc 設定 `ice_servers` の既定値） |
 | `stun:stun.l.google.com:19302` + `stun:stun.cloudflare.com:3478` | ブラウザ側 |
 
-カメラの go2rtc は内部で `stun.l.google.com` を使って公開 IP を取得するため、カメラ側の STUN サーバーは事実上変更できない。
+カメラ側の STUN サーバーは `mocula_live.sh` が生成する go2rtc 設定（`ice_servers`）で指定する。既定は `stun.l.google.com`。
 
 ### TURN 不採用の根拠
 

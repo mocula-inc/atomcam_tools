@@ -41,14 +41,19 @@ camera_sync_save_error() {
   FAIL_TYPE="$1"
   FAIL_DETAIL="$2"
   SYNC_FAIL_COUNT=$((SYNC_FAIL_COUNT + 1))
+  # SD カードの摩耗を防ぐため、連続失敗の 1 回目と以降 10 回ごとにのみ保存する
+  [ $SYNC_FAIL_COUNT -ne 1 ] && [ $((SYNC_FAIL_COUNT % 10)) -ne 0 ] && return 0
   ERROR_DIR=/media/mmc/errors
   [ -d /media/mmc ] || return 0
-  mkdir -p "$ERROR_DIR"
+  if ! mkdir -p "$ERROR_DIR" 2>/dev/null; then
+    log "camera_sync_save_error: cannot create $ERROR_DIR"
+    return 0
+  fi
 
   ROUTER=$(cat /tmp/router_address 2>/dev/null)
   BOOT_TIME=$(awk '/^btime/ {print $2}' /proc/stat)
-  BOOT_TIME_STR=$(date -d @$BOOT_TIME +"%Y/%m/%d %H:%M:%S")
-  cat > "$ERROR_DIR/error-status.txt" << EOF
+  BOOT_TIME_STR=$(date -d "@$BOOT_TIME" +"%Y/%m/%d %H:%M:%S" 2>/dev/null)
+  if ! cat > "$ERROR_DIR/error-status.txt" 2>/dev/null << EOF
 === Mocula camera-sync error ===
 Boot time        : $BOOT_TIME_STR
 Error time       : $(date +"%Y/%m/%d %H:%M:%S")
@@ -62,9 +67,13 @@ IP Address       : ${IP_ADDR:-(unknown)}
 Default Gateway  : ${ROUTER:-(unknown)}
 API origin       : ${API_ORIGIN:-(unknown)}
 EOF
+  then
+    log "camera_sync_save_error: failed to write $ERROR_DIR/error-status.txt"
+    return 0
+  fi
 
-  [ -f "$LOGFILE" ] && cp "$LOGFILE" "$ERROR_DIR/mocula.log"
-  [ -f /media/mmc/healthcheck.log ] && cp /media/mmc/healthcheck.log "$ERROR_DIR/healthcheck.log"
+  [ -f "$LOGFILE" ] && cp "$LOGFILE" "$ERROR_DIR/mocula.log" 2>/dev/null
+  [ -f /media/mmc/healthcheck.log ] && cp /media/mmc/healthcheck.log "$ERROR_DIR/healthcheck.log" 2>/dev/null
 }
 
 stop_daemon() {
@@ -499,9 +508,10 @@ ${NEW_URL_QUEUE}"
     fi
 
     if [ "$IS_ENABLED" = "true" ]; then
-      # UPTIME_START と UPTIME_END の両方が設定されている場合、現在の uptime がその範囲内にあるときのみアップロードする
+      # UPTIME_START と UPTIME_END の両方が設定されている場合、現在時刻(HHMMSS)がその範囲内にあるときのみアップロードする
+      # (uptimeStart/uptimeEnd は API のフィールド名。システム稼働時間ではなく時刻(時分秒)を表す)
       if [ -n "$UPTIME_START" ] && [ -n "$UPTIME_END" ]; then
-        NOW_HMS_NUM=$(expr $(date +"%H%m%S") + 0)
+        NOW_HMS_NUM=$(expr $(date +"%H%M%S") + 0)
         if [ $NOW_HMS_NUM -lt $(expr $UPTIME_START + 0) ] || [ $NOW_HMS_NUM -gt $(expr $UPTIME_END + 0) ]; then
           sleep 1
           CONFIG_COUNTER=$((CONFIG_COUNTER + 1))

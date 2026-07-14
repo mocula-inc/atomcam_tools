@@ -52,7 +52,12 @@ stack_start() {
     log "stack_start: foreign stack detected, refusing"
     return 1
   fi
-  [ -f "$STACK_MARKER" ] && return 0
+  if [ -f "$STACK_MARKER" ]; then
+    # マーカーが残っていても異常終了の残骸の可能性があるため、go2rtc の応答を実際に確認する
+    curl -s -o /dev/null -m 2 "http://127.0.0.1:1984/api" 2>/dev/null && return 0
+    log "stack_start: stale stack marker detected, cleaning up"
+    _stack_stop_internal
+  fi
 
   log "stack_start: enabling video encoder ch0"
   /scripts/cmd video 0 on > /dev/null 2>&1
@@ -165,6 +170,7 @@ poll_backend() {
     -w '%{http_code}' \
     "$API_ORIGIN/api/v1/live-signal/$TENANT_KEY/$CAMERA_KEY/poll" 2>/dev/null)
 
+  POLL_HTTP_CODE="$http_code"
   log_debug "poll_backend: state=$state http=$http_code"
 
   case "$http_code" in
@@ -185,6 +191,8 @@ poll_backend() {
 
 handle_offer() {
   local session_id="$1"
+  local start_ts elapsed budget
+  start_ts=$(date +%s)
   log_debug "handle_offer: session=$session_id"
 
   if ! stack_start; then
@@ -195,9 +203,22 @@ handle_offer() {
     return 1
   fi
 
-  # Blocks until go2rtc gathers ICE candidates (non-trickle), up to 25s
+  # バックエンドの answer 期限(ブラウザのセッション開始から約28秒)に間に合うよう、
+  # stack_start に費やした時間を差し引いた残り時間で go2rtc の SDP 交換を行う。
+  # 間に合わない場合は遅れた answer を送らず stack_failed で早期にフォールバックさせる
+  elapsed=$(( $(date +%s) - start_ts ))
+  budget=$((22 - elapsed))
+  if [ $budget -lt 5 ]; then
+    log "handle_offer: stack_start too slow (${elapsed}s), reporting stack_failed"
+    curl -s -m 15 -X POST \
+      "$API_ORIGIN/api/v1/live-signal/$TENANT_KEY/$CAMERA_KEY/answer?session=${session_id}&error=stack_failed" \
+      > /dev/null 2>&1
+    return 1
+  fi
+
+  # Blocks until go2rtc gathers ICE candidates (non-trickle)
   local http_code
-  http_code=$(curl -s -m 25 -X POST \
+  http_code=$(curl -s -m $budget -X POST \
     -H 'Content-Type: application/sdp' \
     --data-binary @"$OFFER_FILE" \
     -o "$ANSWER_FILE" \
@@ -221,25 +242,42 @@ handle_offer() {
     -w '%{http_code}' \
     "$API_ORIGIN/api/v1/live-signal/$TENANT_KEY/$CAMERA_KEY/answer?session=${session_id}" 2>/dev/null)
 
-  log_debug "handle_offer: answer sent http=$http_code"
-  return 0
+  case "$http_code" in
+    2*)
+      log_debug "handle_offer: answer sent http=$http_code"
+      return 0
+      ;;
+    *)
+      # answer がバックエンドに届いていないため streaming にはせず、スタックを畳んで失敗を返す
+      log "handle_offer: answer delivery failed http=$http_code"
+      stack_stop
+      return 1
+      ;;
+  esac
 }
 
 image_mode() {
   local session_id="$1"
   local elapsed=0
   local fail_count=0
+  local post_fail=0
   local frame_file="/tmp/mocula-live-frame.jpg"
-  local action
+  local action http_code
 
   log "image_mode: starting session=$session_id"
 
   while [ $elapsed -lt "$LIVE_IMAGE_MAX" ]; do
     /scripts/cmd jpeg 1 | sed '1,3d' > "$frame_file"
-    if [ ! -s "$frame_file" ]; then
+    # JPEG マジックバイト(ff d8)を確認し、cmd のエラー出力等をフレームとして送らない
+    # (BusyBox od は -A/-t/-N 非対応のため od -b を使う)
+    if [ ! -s "$frame_file" ] || \
+       [ "$(head -c 2 "$frame_file" | od -b | awk 'NR==1{print $2 $3}')" != "377330" ]; then
       fail_count=$((fail_count + 1))
       log_debug "image_mode: capture failed count=$fail_count"
-      [ $fail_count -ge 5 ] && break
+      if [ $fail_count -ge 5 ]; then
+        log "image_mode: JPEG capture failed ${fail_count} times, aborting"
+        break
+      fi
       sleep 5
       elapsed=$((elapsed + 5))
       continue
@@ -247,12 +285,28 @@ image_mode() {
     fail_count=0
 
     rm -f "$CURL_HDRS"
-    curl -s -m 15 -X POST \
+    http_code=$(curl -s -m 15 -X POST \
       -H 'Content-Type: image/jpeg' \
       --data-binary @"$frame_file" \
       -D "$CURL_HDRS" \
       -o /dev/null \
-      "$API_ORIGIN/api/v1/live-frame/$TENANT_KEY/$CAMERA_KEY?session=${session_id}" 2>/dev/null
+      -w '%{http_code}' \
+      "$API_ORIGIN/api/v1/live-frame/$TENANT_KEY/$CAMERA_KEY?session=${session_id}" 2>/dev/null)
+
+    case "$http_code" in
+      2*)
+        post_fail=0
+        ;;
+      *)
+        # セッションがサーバ側で消えている(404 等)のに送り続けるのを防ぐ
+        post_fail=$((post_fail + 1))
+        log "image_mode: frame post failed http=$http_code count=$post_fail"
+        if [ $post_fail -ge 5 ]; then
+          log "image_mode: frame post failed ${post_fail} times, aborting"
+          break
+        fi
+        ;;
+    esac
 
     action=$(grep -i '^x-mocula-action:' "$CURL_HDRS" 2>/dev/null | awk -F': ' '{ gsub(/\r/, "", $2); print $2 }')
     log_debug "image_mode: posted action=${action:-continue}"
@@ -276,6 +330,10 @@ run_daemon() {
 
   trap 'stack_stop; exit 0' EXIT INT TERM
 
+  # 前回デーモンが異常終了(SIGKILL 等)した場合に残る自前スタックとマーカーを清算する。
+  # マーカーが無いときの go2rtc/v4l2rtspserver は外部(RTSP/HomeKit)のものなので触らない
+  [ -f "$STACK_MARKER" ] && _stack_stop_internal
+
   local streaming=0
   local idle_sec=0
   local poll_fail=0
@@ -286,9 +344,10 @@ run_daemon() {
     state="idle"
     consumers=0
 
-    # Detect unexpected go2rtc crash
-    if [ "$streaming" = "1" ] && [ -f "$STACK_MARKER" ] && ! pidof go2rtc > /dev/null 2>&1; then
-      log "go2rtc died unexpectedly, resetting"
+    # Detect unexpected go2rtc / v4l2rtspserver crash
+    if [ "$streaming" = "1" ] && [ -f "$STACK_MARKER" ] && \
+       { ! pidof go2rtc > /dev/null 2>&1 || ! pidof v4l2rtspserver > /dev/null 2>&1; }; then
+      log "streaming stack died unexpectedly, resetting"
       _stack_stop_internal
       streaming=0
       idle_sec=0
@@ -336,7 +395,12 @@ run_daemon() {
       local backoff=5
       [ $poll_fail -ge 6 ] && backoff=30
       [ $poll_fail -ge 12 ] && backoff=60
-      log_debug "poll failed ${poll_fail} times, backoff=${backoff}s"
+      # バックエンド到達不可は最頻の障害要因なので、初回と 12 回ごとに通常ログにも出す
+      if [ $poll_fail -eq 1 ] || [ $((poll_fail % 12)) -eq 0 ]; then
+        log "poll failed ${poll_fail} times (http=${POLL_HTTP_CODE:-none}), backoff=${backoff}s"
+      else
+        log_debug "poll failed ${poll_fail} times, backoff=${backoff}s"
+      fi
       sleep $backoff
     fi
   done
