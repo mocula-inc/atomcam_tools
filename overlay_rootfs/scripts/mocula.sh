@@ -81,8 +81,12 @@ stop_daemon() {
     kill $(cat $PIDFILE) > /dev/null 2>&1
     rm -f $PIDFILE
   fi
-  # killall は自スクリプトも巻き込むため、自PID($$)を除外して個別に kill する
-  for pid in $(ps | awk -v mypid=$$ '/mocula\.sh/ && $1 != mypid {print $1}'); do
+  # killall は自スクリプトも巻き込むため、mocula.sh デーモンを個別に kill する。
+  # awk -v がプログラムと連結して壊れる不具合を避けるため grep の [m] トリックで抽出する。
+  # このパターンは mocula.log を tail するプロセスや mocula_live.sh には一致しない。
+  # 自プロセス($$)はループ内で除外する。
+  for pid in $(ps | grep '[m]ocula\.sh' | awk '{print $1}'); do
+    [ "$pid" = "$$" ] && continue
     kill "$pid" > /dev/null 2>&1
   done
 }
