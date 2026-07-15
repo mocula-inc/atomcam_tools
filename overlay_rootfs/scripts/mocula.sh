@@ -191,6 +191,8 @@ camera_sync() {
   [ -n "$FW_CURRENT" ] && FW_VERSION_JSON=$(printf ',"firmwareVersion":"%s"' "$FW_CURRENT")
   build_firmware_update_report
 
+  LIVE_ACTION="none"
+  LIVE_SESSION=""
   log_debug "camera_sync: POST ${API_ORIGIN}/api/v1/camera-sync/${TENANT_KEY}/${CAMERA_KEY}"
   SYNC_REQUEST_MS=$(current_epoch_ms)
   RESPONSE=$(curl --silent --max-time 30 \
@@ -262,6 +264,13 @@ camera_sync() {
   log_debug "camera_sync: isEnabled=$IS_ENABLED checkInterval=$CHECK_INTERVAL urlCount=$(echo "$NEW_URL_QUEUE" | grep -c .)"
   parse_firmware_update_offer
   sync_clock_from_server
+
+  # ライブ開始シグナル(liveAction/liveSessionId)は脆い汎用パーサを通さず専用抽出する。
+  # backend は常にスカラの両キーを返す約束(SDP 等は載せない)なので狙い撃ちの sed で安全に読める。
+  LIVE_ACTION=$(echo "$RESPONSE" | sed -n 's/.*"liveAction":"\([^"]*\)".*/\1/p')
+  LIVE_SESSION=$(echo "$RESPONSE" | sed -n 's/.*"liveSessionId":"\([^"]*\)".*/\1/p')
+  [ -z "$LIVE_ACTION" ] && LIVE_ACTION="none"
+  log_debug "camera_sync: liveAction=$LIVE_ACTION liveSessionId=$LIVE_SESSION"
 }
 
 next_upload_url() {
@@ -481,12 +490,20 @@ run_daemon() {
   UPTIME_START=""
   UPTIME_END=""
   SYNC_FAIL_COUNT=0
+  LAST_LIVE_SESSION=""
 
   while true; do
     # Sync with server every 60 seconds
     if [ $CONFIG_COUNTER -ge 60 ] || [ $CONFIG_COUNTER -eq 0 ]; then
       log_debug "loop: triggering camera_sync (config_counter=$CONFIG_COUNTER)"
       camera_sync
+      # ライブ開始トリガ: liveAction=offer かつ 未処理の新しい liveSessionId のときだけ
+      # mocula_live.sh をオンデマンド起動する。同一 id での再 spawn を防ぐ多重防御。
+      if [ "$LIVE_ACTION" = "offer" ] && [ -n "$LIVE_SESSION" ] && [ "$LIVE_SESSION" != "$LAST_LIVE_SESSION" ]; then
+        LAST_LIVE_SESSION="$LIVE_SESSION"
+        log "live start trigger session=$LIVE_SESSION"
+        /scripts/mocula_live.sh start "$LIVE_SESSION" > /dev/null 2>&1 &
+      fi
       CONFIG_COUNTER=0
       if [ -n "$URL_QUEUE" ]; then
         # まだ消化しきっていない分が残っている場合は上書きせず末尾に追加するだけに

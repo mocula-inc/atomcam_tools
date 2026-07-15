@@ -1,6 +1,11 @@
 #!/bin/sh
 
-PIDFILE=/var/run/mocula-live.pid
+# ライブビュー セッションランナー(オンデマンド)。
+# 常時ロングポーリングは廃止。mocula.sh の camera-sync が liveAction=offer を
+# 受け取ると `mocula_live.sh start <sessionId>` をオンデマンド起動し、この
+# プロセスが 1 セッションの生存期間だけ存在してストリームを張り、終わったら exit する。
+
+PIDFILE=/var/run/mocula-live.pid       # = セッション実行中ロック
 DISABLEFILE=/var/run/mocula-live.disabled
 LOGFILE=/tmp/log/mocula-live.log
 STACK_MARKER=/var/run/mocula-live.stack
@@ -30,15 +35,9 @@ load_config() {
   DEBUG_MODE="${global_debug:-0}"
   LIVE_DISABLED="${live_disabled:-0}"
   LIVE_IDLE_TIMEOUT="${live_idleTimeout:-120}"
-  LIVE_POLL_TIMEOUT="${live_pollTimeout:-55}"
   LIVE_IMAGE_MAX="${live_imageMax:-600}"
-}
-
-stop_daemon() {
-  if [ -f "$PIDFILE" ]; then
-    kill "$(cat "$PIDFILE")" > /dev/null 2>&1
-    rm -f "$PIDFILE"
-  fi
+  LIVE_SESSION_POLL="${live_sessionPoll:-10}"
+  LIVE_SESSION_MAX="${live_sessionMax:-600}"
 }
 
 # returns 0 (true) if a go2rtc/v4l2rtspserver not started by us is running
@@ -151,90 +150,58 @@ has_consumers() {
   curl -s -m 5 "http://127.0.0.1:1984/api/streams" 2>/dev/null | grep -q '"consumers":\[{'
 }
 
-poll_backend() {
-  local state="$1"
-  local consumers="$2"
-  local timeout="$LIVE_POLL_TIMEOUT"
-  [ "$state" = "streaming" ] && timeout=10
-
-  ACTION=""
-  SESSION_ID=""
-  rm -f "$CURL_HDRS" "$OFFER_FILE"
-
+# offer SDP を単発 GET で取得する(camera-sync には SDP を載せない)
+fetch_offer() {
+  local session_id="$1"
   local http_code
-  http_code=$(curl -s -m $((timeout + 5)) -X POST \
-    -H 'Content-Type: application/json' \
-    -d "{\"state\":\"${state}\",\"consumers\":${consumers}}" \
-    -D "$CURL_HDRS" \
+  rm -f "$OFFER_FILE"
+  http_code=$(curl -s -m 15 -X GET \
     -o "$OFFER_FILE" \
     -w '%{http_code}' \
-    "$API_ORIGIN/api/v1/live-signal/$TENANT_KEY/$CAMERA_KEY/poll" 2>/dev/null)
-
-  POLL_HTTP_CODE="$http_code"
-  log_debug "poll_backend: state=$state http=$http_code"
-
-  case "$http_code" in
-    200)
-      ACTION=$(grep -i '^x-mocula-action:' "$CURL_HDRS" 2>/dev/null | awk -F': ' '{ gsub(/\r/, "", $2); print $2 }')
-      SESSION_ID=$(grep -i '^x-mocula-session:' "$CURL_HDRS" 2>/dev/null | awk -F': ' '{ gsub(/\r/, "", $2); print $2 }')
-      return 0
-      ;;
-    204)
-      return 0
-      ;;
-    *)
-      log_debug "poll_backend: error http=$http_code"
-      return 1
-      ;;
-  esac
+    "$API_ORIGIN/api/v1/live-signal/$TENANT_KEY/$CAMERA_KEY/offer?session=${session_id}" 2>/dev/null)
+  log_debug "fetch_offer: http=$http_code size=$(wc -c < "$OFFER_FILE" 2>/dev/null)"
+  [ "$http_code" = "200" ] && [ -s "$OFFER_FILE" ]
 }
 
+# TODO(確認待ち): 確定プロトコルにカメラ→backend の answer 提出/エラー報告経路が
+# 明示されていない。既存の POST /answer?session=id(application/sdp, ?error=busy|stack_failed)
+# が据え置きである前提で実装している。オーケストレーターの確認後に確定させる。
+report_answer_error() {
+  curl -s -m 15 -X POST \
+    "$API_ORIGIN/api/v1/live-signal/$TENANT_KEY/$CAMERA_KEY/answer?session=${1}&error=${2}" \
+    > /dev/null 2>&1
+}
+
+# OFFER_FILE の offer を go2rtc に渡して answer を得て backend に提出する
 handle_offer() {
   local session_id="$1"
-  local start_ts elapsed budget
-  start_ts=$(date +%s)
+  local http_code
   log_debug "handle_offer: session=$session_id"
 
   if ! stack_start; then
     log "handle_offer: stack_start failed, reporting busy"
-    curl -s -m 15 -X POST \
-      "$API_ORIGIN/api/v1/live-signal/$TENANT_KEY/$CAMERA_KEY/answer?session=${session_id}&error=busy" \
-      > /dev/null 2>&1
+    report_answer_error "$session_id" busy
     return 1
   fi
 
-  # バックエンドの answer 期限(ブラウザのセッション開始から約28秒)に間に合うよう、
-  # stack_start に費やした時間を差し引いた残り時間で go2rtc の SDP 交換を行う。
-  # 間に合わない場合は遅れた answer を送らず stack_failed で早期にフォールバックさせる
-  elapsed=$(( $(date +%s) - start_ts ))
-  budget=$((22 - elapsed))
-  if [ $budget -lt 5 ]; then
-    log "handle_offer: stack_start too slow (${elapsed}s), reporting stack_failed"
-    curl -s -m 15 -X POST \
-      "$API_ORIGIN/api/v1/live-signal/$TENANT_KEY/$CAMERA_KEY/answer?session=${session_id}&error=stack_failed" \
-      > /dev/null 2>&1
-    return 1
-  fi
-
-  # Blocks until go2rtc gathers ICE candidates (non-trickle)
-  local http_code
-  http_code=$(curl -s -m $budget -X POST \
+  # go2rtc が ICE candidates を収集し終えるまでブロック(non-trickle)。
+  # 旧仕様の 28 秒デッドラインは撤廃されたため、固定の妥当なタイムアウトにする。
+  http_code=$(curl -s -m 25 -X POST \
     -H 'Content-Type: application/sdp' \
     --data-binary @"$OFFER_FILE" \
     -o "$ANSWER_FILE" \
     -w '%{http_code}' \
     "http://127.0.0.1:1984/api/webrtc?src=video0" 2>/dev/null)
-
   log_debug "handle_offer: go2rtc exchange http=$http_code"
 
   if [ "$http_code" != "201" ] || [ ! -s "$ANSWER_FILE" ]; then
     log "handle_offer: go2rtc exchange failed http=$http_code"
-    curl -s -m 15 -X POST \
-      "$API_ORIGIN/api/v1/live-signal/$TENANT_KEY/$CAMERA_KEY/answer?session=${session_id}&error=stack_failed" \
-      > /dev/null 2>&1
+    report_answer_error "$session_id" stack_failed
+    stack_stop
     return 1
   fi
 
+  # answer を backend に提出(TODO 確認待ちのエンドポイント、上記参照)
   http_code=$(curl -s -m 15 -X POST \
     -H 'Content-Type: application/sdp' \
     --data-binary @"$ANSWER_FILE" \
@@ -252,6 +219,31 @@ handle_offer() {
       log "handle_offer: answer delivery failed http=$http_code"
       stack_stop
       return 1
+      ;;
+  esac
+}
+
+# セッション中の双方向通信: state/consumers を報告し、action(continue|stop|image)を受ける
+session_status() {
+  local session_id="$1"
+  local state="$2"
+  local consumers="$3"
+  local http_code
+  STATUS_ACTION=""
+  rm -f "$CURL_HDRS"
+  http_code=$(curl -s -m 15 -X POST \
+    -H 'Content-Type: application/json' \
+    -d "{\"state\":\"${state}\",\"consumers\":${consumers}}" \
+    -D "$CURL_HDRS" \
+    -o /dev/null \
+    -w '%{http_code}' \
+    "$API_ORIGIN/api/v1/live-signal/$TENANT_KEY/$CAMERA_KEY/status?session=${session_id}" 2>/dev/null)
+  case "$http_code" in
+    2*)
+      STATUS_ACTION=$(grep -i '^x-mocula-action:' "$CURL_HDRS" 2>/dev/null | awk -F': ' '{ gsub(/\r/, "", $2); print $2 }')
+      ;;
+    *)
+      log_debug "session_status: http=$http_code"
       ;;
   esac
 }
@@ -320,127 +312,130 @@ image_mode() {
   log "image_mode: ended elapsed=${elapsed}s"
 }
 
-run_daemon() {
-  load_config || exit 0
-  [ -z "$TENANT_KEY" ] || [ -z "$CAMERA_KEY" ] && { log "tenantKey/cameraKey not set"; exit 1; }
-  [ "$LIVE_DISABLED" = "1" ] && exit 0
+# 1 セッションを最初から最後まで実行する
+run_session() {
+  local session_id="$1"
+  local idle_sec=0
+  local session_sec=0
+  local consumers
 
-  log "mocula-live started pid=$$"
-  log_debug "config: origin=$API_ORIGIN tenant=$TENANT_KEY camera=$CAMERA_KEY"
+  log "session start id=$session_id"
+  log_debug "config: origin=$API_ORIGIN tenant=$TENANT_KEY camera=$CAMERA_KEY sessionPoll=$LIVE_SESSION_POLL"
 
-  trap 'stack_stop; exit 0' EXIT INT TERM
-
-  # 前回デーモンが異常終了(SIGKILL 等)した場合に残る自前スタックとマーカーを清算する。
-  # マーカーが無いときの go2rtc/v4l2rtspserver は外部(RTSP/HomeKit)のものなので触らない
+  # 前回異常終了(SIGKILL 等)で残った自前スタックを清算してから始める
   [ -f "$STACK_MARKER" ] && _stack_stop_internal
 
-  local streaming=0
-  local idle_sec=0
-  local poll_fail=0
-  local consumers=0
-  local state
+  if ! fetch_offer "$session_id"; then
+    log "session: offer fetch failed id=$session_id"
+    return 1
+  fi
 
+  if ! handle_offer "$session_id"; then
+    return 1
+  fi
+
+  # セッション中ループ: state/consumers を報告し stop/image を処理する
   while true; do
-    state="idle"
-    consumers=0
-
-    # Detect unexpected go2rtc / v4l2rtspserver crash
-    if [ "$streaming" = "1" ] && [ -f "$STACK_MARKER" ] && \
+    # go2rtc / v4l2rtspserver のクラッシュ検知
+    if [ -f "$STACK_MARKER" ] && \
        { ! pidof go2rtc > /dev/null 2>&1 || ! pidof v4l2rtspserver > /dev/null 2>&1; }; then
-      log "streaming stack died unexpectedly, resetting"
-      _stack_stop_internal
-      streaming=0
+      log "session: stack died unexpectedly"
+      break
+    fi
+
+    if has_consumers; then
       idle_sec=0
-    fi
-
-    if [ "$streaming" = "1" ]; then
-      state="streaming"
-      if has_consumers; then
-        idle_sec=0
-        consumers=1
-      else
-        idle_sec=$((idle_sec + 10))
-        if [ $idle_sec -ge "$LIVE_IDLE_TIMEOUT" ]; then
-          log "idle timeout, stopping stack"
-          stack_stop
-          streaming=0
-          idle_sec=0
-          state="idle"
-        fi
-      fi
-    fi
-
-    if poll_backend "$state" "$consumers"; then
-      poll_fail=0
-      case "$ACTION" in
-        offer)
-          log "offer received session=$SESSION_ID"
-          handle_offer "$SESSION_ID" && streaming=1
-          ;;
-        image)
-          log "image mode requested session=$SESSION_ID"
-          image_mode "$SESSION_ID"
-          ;;
-        stop)
-          log "stop received"
-          stack_stop
-          streaming=0
-          idle_sec=0
-          ;;
-        ""|*)
-          ;;
-      esac
+      consumers=1
     else
-      poll_fail=$((poll_fail + 1))
-      local backoff=5
-      [ $poll_fail -ge 6 ] && backoff=30
-      [ $poll_fail -ge 12 ] && backoff=60
-      # バックエンド到達不可は最頻の障害要因なので、初回と 12 回ごとに通常ログにも出す
-      if [ $poll_fail -eq 1 ] || [ $((poll_fail % 12)) -eq 0 ]; then
-        log "poll failed ${poll_fail} times (http=${POLL_HTTP_CODE:-none}), backoff=${backoff}s"
-      else
-        log_debug "poll failed ${poll_fail} times, backoff=${backoff}s"
+      idle_sec=$((idle_sec + LIVE_SESSION_POLL))
+      consumers=0
+      if [ $idle_sec -ge "$LIVE_IDLE_TIMEOUT" ]; then
+        log "session: idle timeout (no consumers)"
+        break
       fi
-      sleep $backoff
     fi
+
+    session_status "$session_id" "streaming" "$consumers"
+    case "$STATUS_ACTION" in
+      stop)
+        log "session: stop received"
+        break
+        ;;
+      image)
+        log "session: image fallback requested"
+        image_mode "$session_id"
+        break
+        ;;
+    esac
+
+    session_sec=$((session_sec + LIVE_SESSION_POLL))
+    if [ $session_sec -ge "$LIVE_SESSION_MAX" ]; then
+      log "session: max duration reached"
+      break
+    fi
+    sleep "$LIVE_SESSION_POLL"
   done
+
+  stack_stop
+  log "session end id=$session_id"
+}
+
+# 実行中セッションを停止する(ロック保持プロセスを kill)
+kill_session() {
+  if [ -f "$PIDFILE" ]; then
+    kill "$(cat "$PIDFILE")" > /dev/null 2>&1
+    rm -f "$PIDFILE"
+  fi
 }
 
 case "$1" in
-  on)
+  start)
     [ -f /media/mmc/mconfig ] || exit 0
-    rm -f "$DISABLEFILE"
-    stop_daemon
-    run_daemon &
-    echo $! > "$PIDFILE"
+    load_config || exit 0
+    [ "$LIVE_DISABLED" = "1" ] && exit 0
+    [ -f "$DISABLEFILE" ] && exit 0
+    [ -z "$TENANT_KEY" ] || [ -z "$CAMERA_KEY" ] && { log "start: tenantKey/cameraKey not set"; exit 1; }
+    session_id="$2"
+    [ -z "$session_id" ] && { log "start: no session id"; exit 1; }
+
+    # 多重起動防止(ロック): 既にセッション実行中なら何もしない
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" > /dev/null 2>&1; then
+      log "start: session already running, ignoring id=$session_id"
+      exit 0
+    fi
+    echo $$ > "$PIDFILE"
+    trap 'stack_stop; rm -f "$PIDFILE"; exit 0' EXIT INT TERM
+    run_session "$session_id"
     ;;
   off)
     touch "$DISABLEFILE"
-    stop_daemon
+    load_config 2>/dev/null
+    kill_session
+    stack_stop
     log "mocula-live stopped"
     ;;
-  restart)
+  on)
+    # 常駐は無くオンデマンド起動なので、disable 解除のみ行う
     rm -f "$DISABLEFILE"
-    stop_daemon
-    [ -f /media/mmc/mconfig ] || exit 0
-    run_daemon &
-    echo $! > "$PIDFILE"
+    ;;
+  restart)
+    # 実行中セッションを停止する(次の camera-sync トリガで再開される)
+    rm -f "$DISABLEFILE"
+    load_config 2>/dev/null
+    kill_session
+    stack_stop
     ;;
   watchdog)
+    # 常駐維持は不要。セッション未実行なのに自前スタックが残っていたら清算する
     [ -f /media/mmc/mconfig ] || exit 0
-    [ -f "$DISABLEFILE" ] && exit 0
-    if [ -f "$PIDFILE" ]; then
-      PID=$(cat "$PIDFILE")
-      if kill -0 "$PID" > /dev/null 2>&1; then
-        exit 0
-      fi
+    load_config 2>/dev/null
+    if [ ! -f "$PIDFILE" ] || ! kill -0 "$(cat "$PIDFILE" 2>/dev/null)" > /dev/null 2>&1; then
+      rm -f "$PIDFILE"
+      [ -f "$STACK_MARKER" ] && { log "watchdog: cleaning orphan stack"; _stack_stop_internal; }
     fi
-    log "watchdog: restarting mocula-live"
-    run_daemon &
-    echo $! > "$PIDFILE"
     ;;
   *)
-    echo "Usage: $0 {on|off|restart|watchdog}"
+    echo "Usage: $0 {start <sessionId>|on|off|restart|watchdog}"
     exit 1
     ;;
 esac

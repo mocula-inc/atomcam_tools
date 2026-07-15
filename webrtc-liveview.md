@@ -3,7 +3,14 @@
 ## 概要
 
 ブラウザからネットワークカメラの映像をリアルタイムに閲覧する機能の仕様。  
-カメラは NAT 内ネットワークにあり、バックエンドへのアウトバウンド HTTPS のみ可能なため、シグナリングはバックエンド経由のロングポーリングで行う。
+カメラは NAT 内ネットワークにあり、バックエンドへのアウトバウンド HTTPS のみ可能。
+
+> **シグナリング方式（2026-07 更新）**: 常時ロングポーリングは廃止した。ライブ開始指示は既存の
+> camera-sync（`POST /api/v1/camera-sync/...`、mocula.sh が 60 秒ごとに送信）のレスポンスに
+> `liveAction` / `liveSessionId`（スカラのみ）を混ぜて配信する。カメラは開始指示を受けたときだけ
+> `mocula_live.sh` をオンデマンド起動し、1 セッションの生存期間だけ双方向通信する。視聴者は開始まで
+> 最大 60 秒待つ。SDP 本体は camera-sync には載せず、別リクエスト（`/offer` GET）で取得する。
+> API の正本はバックエンドの OpenAPI 定義を参照。以下は本方式に合わせて改訂中。
 
 **P2P 成立時**: go2rtc を介した H.264 WebRTC ストリーム（ハードウェアエンコード済み、1920×1080）  
 **P2P 不成立時**: 5 秒おきの JPEG 静止画をバックエンド経由でブラウザに配信
@@ -14,10 +21,13 @@
 
 ```
 [ブラウザ]
-    │  WebSocket/HTTPS (app.mocula.jp)
+    │  HTTPS (app.mocula.jp)
     ▼
-[バックエンド]
-    │  HTTPS long-poll (カメラ → バックエンド)
+[バックエンド] ◄─ camera-sync 応答に liveAction=offer を載せる（60秒周期）
+    │                                    │
+    │  ① mocula.sh が検知 → mocula_live.sh start <id> をオンデマンド起動
+    │  ② GET /offer で offer SDP 取得（単発）
+    │  ③ POST /status で state/consumers 報告・stop/image 受信（セッション中のみ、既定10秒間隔）
     ▼
 [カメラ: mocula_live.sh]
     │  localhost:1984 (go2rtc API)
@@ -67,45 +77,45 @@ ANSWERED       ──── タイムアウト (~25s) ────────�
 
 認証: `tenantKey` / `cameraKey` による URL パス認証（camera-sync と同じモデル）
 
-### `POST /api/v1/live-signal/{tenantKey}/{cameraKey}/poll`
+### ライブ開始トリガ（camera-sync レスポンス）
 
-カメラが定期的に呼ぶロングポーリングエンドポイント。バックエンドはアクションが発生するまで保留する（実装では最大 25 秒で 204 を返し、カメラはそのまま再 poll する）。カメラ側の待機上限は `live_pollTimeout`（既定 55 秒）。
+`POST /api/v1/live-signal/.../poll` の常時ロングポーリングは**廃止**。開始指示は camera-sync
+（`POST /api/v1/camera-sync/{tenantKey}/{cameraKey}`）のレスポンス `data` に以下のスカラ 2 キーで載せる。
+キー欠落は不可（パーサの位置ズレ防止のため常に両方返す）。
 
-**リクエストボディ** (application/json):
-```json
-{
-  "state": "idle | streaming",
-  "consumers": 0
-}
-```
+| フィールド | 値 | 説明 |
+|-----------|-----|------|
+| `liveAction` | `"offer"` \| `"none"` | `offer` のときライブ開始。指示なしは `none` |
+| `liveSessionId` | `"<uuid>"` \| `""` | セッション識別子。`none` のときは空文字 |
 
-**レスポンス**:
+カメラ（mocula.sh）は `liveAction=offer` かつ未処理の新しい `liveSessionId` を検出したときだけ
+`mocula_live.sh start <id>` をオンデマンド起動する（直近処理 id を記録し同一 id では再起動しない）。
+バックエンドはセッションが active 化したら以降の camera-sync で `liveAction:"none"` を返す（再トリガ防止）。
 
-| ステータス | 意味 |
-|-----------|------|
-| 204 | アクションなし（タイムアウト） |
-| 200 + ヘッダ | アクションあり（下記参照） |
+### `GET /api/v1/live-signal/{tenantKey}/{cameraKey}/offer?session={id}`
 
-アクションありの場合のレスポンスヘッダ:
-
-| ヘッダ | 値 | 説明 |
-|--------|-----|------|
-| `X-Mocula-Action` | `offer` | WebRTC offer SDP を配信する |
-| `X-Mocula-Action` | `image` | 静止画モードを開始する |
-| `X-Mocula-Action` | `stop` | セッション終了 |
-| `X-Mocula-Session` | `{session_id}` | セッション識別子 |
-
-`action: offer` の場合、ボディは `Content-Type: application/sdp` の生 SDP（JSON エンコード不要）。  
+カメラが offer SDP を単発取得する。**成功**: `200` + `Content-Type: application/sdp`（生 SDP）／ **なし**: `404`。  
 ブラウザの offer SDP は `iceGatheringState === 'complete'` 待機後に送信されたもの（non-trickle）。
+
+### `POST /api/v1/live-signal/{tenantKey}/{cameraKey}/status?session={id}`
+
+セッション実行中のみカメラが `live_sessionPoll`（既定 10 秒）間隔で送る双方向通信エンドポイント。
+
+**リクエストボディ** (application/json): `{ "state": "streaming" | "image", "consumers": <number> }`  
+**レスポンス**: `204` + レスポンスヘッダ `X-Mocula-Action: continue | stop | image`
+（`stop`=セッション終了、`image`=静止画フォールバックへ）
 
 ### `POST /api/v1/live-signal/{tenantKey}/{cameraKey}/answer`
 
 カメラが SDP exchange 結果をバックエンドに返す。
 
+> **要確認（2026-07）**: 新プロトコルの確定リストにカメラ→backend の answer 提出経路が明示されていない。
+> 現状 mocula_live.sh は本エンドポイント据え置きを前提に実装している。バックエンドの実装と要すり合わせ。
+
 **成功時**: `?session={id}` + `Content-Type: application/sdp` ボディ (go2rtc の answer SDP そのまま)  
 **失敗時**: `?session={id}&error=busy` または `?session={id}&error=stack_failed`（ボディなし）
 
-バックエンドはこの answer SDP をブラウザへ転送する。
+バックエンドはこの answer SDP を、ブラウザの answer 取得ロングポーリング（`GET /live-view/{cameraId}/session/{id}/answer`）へ転送する。
 
 ### `POST /api/v1/live-frame/{tenantKey}/{cameraKey}`
 
@@ -262,9 +272,9 @@ function startImageFallback(cameraId, reason) {
 
 | 要件 | 値 | 理由 |
 |-----|----|------|
-| ALB idle timeout | ≥ 60 秒 | カメラの long-poll は最大 55 秒保留 + 5 秒マージン |
+| /status・/offer エンドポイント | 通常の短時間リクエスト | 常時ロングポーリング廃止によりアイドル接続は無い |
 | /live-frame エンドポイント | メモリ or 短 TTL キャッシュのみ | S3 等への書き込みは不要、最新 1 フレームのみ保持 |
-| セッション最大時間 | 任意（推奨 10 分） | カメラ側は `live_imageMax`（既定 600 秒）で自動終了 |
+| セッション最大時間 | 任意（推奨 10 分） | カメラ側は `live_sessionMax`（既定 600 秒）で自動終了 |
 
 ### カメラ側設定（/media/mmc/mconfig）
 
@@ -274,9 +284,12 @@ function startImageFallback(cameraId, reason) {
 [live]
 disabled=0       # 1 にするとモジュール全体を無効化
 idleTimeout=120  # ビューア不在で何秒後にスタックを停止するか
-pollTimeout=55   # アイドル時のロングポーリング待機上限（秒）
 imageMax=600     # 静止画モードの最大継続時間（秒）
+sessionPoll=10   # セッション中の state/consumers 報告間隔（秒）
+sessionMax=600   # 1 セッションの最大継続時間（秒）
 ```
+
+`pollTimeout` はアイドルロングポーリング廃止により削除。
 
 ### 相互排他: hack.ini の RTSP/HomeKit との競合
 
