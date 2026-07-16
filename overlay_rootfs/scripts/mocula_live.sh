@@ -242,6 +242,14 @@ session_status() {
     2*)
       STATUS_ACTION=$(grep -i '^x-mocula-action:' "$CURL_HDRS" 2>/dev/null | awk -F': ' '{ gsub(/\r/, "", $2); print $2 }')
       ;;
+    404|410)
+      # backend がセッションを消失させている(TTL失効等の真の異常系)。
+      # curl 自体の失敗(000 等、応答なし)とは区別し、一過性エラーとしてリトライしない。
+      # 本来 backend は CLOSED 時に 204+stop を返す設計だが、その保険として
+      # 最終防衛線でスタックを畳んで正常終了させる。
+      log "session_status: backend session not found (http=$http_code), treating as implicit stop"
+      STATUS_ACTION="gone"
+      ;;
     *)
       log_debug "session_status: http=$http_code"
       ;;
@@ -359,6 +367,10 @@ run_session() {
     case "$STATUS_ACTION" in
       stop)
         log "session: stop received"
+        break
+        ;;
+      gone)
+        # session_status 内で詳細ログ済み。ここでは正常終了としてループを抜けるのみ
         break
         ;;
       image)
