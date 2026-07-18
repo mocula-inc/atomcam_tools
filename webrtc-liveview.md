@@ -56,7 +56,7 @@ OFFER_QUEUED
   │  バックエンドが offer を保持
   ▼
 SENT_TO_CAMERA
-  │  カメラの /poll レスポンスで offer 配信
+  │  カメラが GET /offer で offer SDP を単発取得
   ▼
 ANSWERED
   │  カメラが /answer に answer SDP を POST
@@ -67,9 +67,15 @@ CONNECTED ──── ブラウザが ICE 失敗を報告 ────► IMAGE
   ▼                                                  ▼
 CLOSED                                           CLOSED
 
-SENT_TO_CAMERA ──── カメラが busy/stack_failed ──► IMAGE_FALLBACK
-ANSWERED       ──── タイムアウト (~25s) ──────────► IMAGE_FALLBACK
+SENT_TO_CAMERA ──── カメラが busy/stack_failed を報告 ──────► IMAGE_FALLBACK
+SENT_TO_CAMERA ──── offer 取得後 30 秒経っても answer 未着 ──► IMAGE_FALLBACK
+ANSWERED       ──── 60 秒経っても consumer が付かない ───────► IMAGE_FALLBACK
+ANSWERED       ──── ブラウザが ICE 失敗を報告 ───────────────► IMAGE_FALLBACK
 ```
+
+※ ice-failed 報告（ブラウザが ICE 接続失敗を検知して通知するエンドポイント）は CLOSED を除く
+どの状態からでも受理される。ANSWERED から answer 受信直後の接続試行で発生するのが典型的で、
+上の図はそのケースを明示するために ANSWERED からの矢印も追加している。
 
 ---
 
@@ -109,9 +115,6 @@ ANSWERED       ──── タイムアウト (~25s) ────────�
 
 カメラが SDP exchange 結果をバックエンドに返す。
 
-> **要確認（2026-07）**: 新プロトコルの確定リストにカメラ→backend の answer 提出経路が明示されていない。
-> 現状 mocula_live.sh は本エンドポイント据え置きを前提に実装している。バックエンドの実装と要すり合わせ。
-
 **成功時**: `?session={id}` + `Content-Type: application/sdp` ボディ (go2rtc の answer SDP そのまま)  
 **失敗時**: `?session={id}&error=busy` または `?session={id}&error=stack_failed`（ボディなし）
 
@@ -132,7 +135,8 @@ ANSWERED       ──── タイムアウト (~25s) ────────�
 | `continue`（または省略） | 次のフレームを送り続ける |
 | `stop` | セッション終了、カメラは静止画ループを抜ける |
 
-カメラ側の最大継続時間: `live_imageMax`（既定 600 秒）。超過した場合はカメラが自動停止する。
+カメラ側の最大継続時間: `live_sessionMax`（既定 600 秒）。WebRTC P2P 区間と合算した配信開始からの
+経過時間で判定するため、P2P からのフォールバック時にカウンタがリセットされることはない。
 
 ---
 
@@ -142,19 +146,39 @@ ANSWERED       ──── タイムアウト (~25s) ────────�
 
 ### `POST /api/v1/live-view/{cameraId}/session`
 
-ブラウザが視聴開始。offer SDP を送り answer SDP を受け取る。バックエンドは最大 30 秒待機。
+ブラウザが視聴開始。offer SDP を送ると answer を待たずに即座に `sessionId` を返す（非同期モデル）。
+answer は別リクエスト（下記 `GET .../answer`）でポーリング取得する。
 
 **リクエスト**: `Content-Type: application/sdp`、ブラウザが生成した offer SDP  
-**レスポンス成功**: `201`、`Content-Type: application/sdp`、カメラからの answer SDP  
+**レスポンス成功**: `202`、`{"sessionId": "<uuid>"}`  
 **レスポンス失敗**:
 
 | ステータス | 意味 |
 |-----------|------|
-| `503 {"reason": "busy"}` | カメラが別スタック使用中（静止画へフォールバック） |
-| `503 {"reason": "timeout"}` | カメラからの応答がタイムアウト（静止画へフォールバック） |
-| `503 {"reason": "stack_failed"}` | カメラ側の起動失敗（静止画へフォールバック） |
+| `404` | カメラが存在しない |
+| `409` | カメラは同時に1セッションしか配信できないため、既に別の視聴セッションがアクティブ |
+
+**409 の実装と再試行のタイミング**: バックエンドは事前チェック(高速パス、`404`同様に軽量)と、
+カメラ単位の排他ロック(DynamoDB `TransactWriteItems` による原子的なロック取得、ほぼ同時の
+リクエストが来た場合の TOCTOU レースを閉じる)の二段構えで多重セッションを防ぐ。ロックは
+視聴中の `/status` 報告のたびにセッション本体の TTL と一緒にスライディング延長されるため、
+先行セッションが視聴を続けている限り 409 が返り続ける。先行セッションが `DELETE` で終了する
+(通常経路)か、TTL(既定600秒)が切れて自動失効すると、以後の作成が成功するようになる。
+クライアント SDK(`mocula-backend` の `client/live-viewer/MoculaLiveViewer.ts`)はこの 409 を
+専用の `LiveViewerAlreadyStreamingError` として `instanceof` 判別できるようにしている。
 
 **ボディが SDP のまま（JSON化しない）理由**: SDP 内の `\r\n` を ash/awk で JSON エスケープするのが困難なため、カメラ〜バックエンド間で SDP を生バイナリとして通す。バックエンド〜ブラウザ間も合わせる。
+
+### `GET /api/v1/live-view/{cameraId}/session/{id}/answer`
+
+ブラウザが answer SDP をポーリング取得する（サーバ側で短時間ロングポーリング）。
+
+| ステータス | 意味 |
+|-----------|------|
+| `200` + `Content-Type: application/sdp` | answer SDP が確定（`setRemoteDescription` へ渡す） |
+| `202` | まだ未確定。サーバ側ロングポーリング窓が尽きただけなので即座に再取得する |
+| `503 {"reason": "busy"\|"stack_failed"\|"timeout"}` | P2P 不成立が確定、静止画フォールバックへ |
+| `404` | セッションが存在しない（TTL 失効等） |
 
 ### `POST /api/v1/live-view/{cameraId}/session/{id}/ice-failed`
 
@@ -169,72 +193,18 @@ ANSWERED       ──── タイムアウト (~25s) ────────�
 最新の静止画フレームを返す。IMAGE_FALLBACK 時にブラウザが 5 秒おきにポーリングする。
 
 **レスポンス**: `Content-Type: image/jpeg`、最新フレーム  
-**フレームがまだない場合**: `503` または `202`（ブラウザ側でリトライ）
+**フレームがまだない場合**: `503`
 
 ---
 
 ## ブラウザ側実装責務
 
-```javascript
-// 1. Offer 生成（ICE gathering complete まで待つ）
-const pc = new RTCPeerConnection({
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' },
-  ]
-});
-pc.addTransceiver('video', { direction: 'recvonly' });
-const offer = await pc.createOffer();
-await pc.setLocalDescription(offer);
-
-await new Promise(resolve => {
-  if (pc.iceGatheringState === 'complete') { resolve(); return; }
-  const timer = setTimeout(resolve, 3000); // 最大 3 秒待ち
-  pc.onicegatheringstatechange = () => {
-    if (pc.iceGatheringState === 'complete') { clearTimeout(timer); resolve(); }
-  };
-});
-
-// 2. バックエンドへ offer 送信、answer 受信
-const resp = await fetch(`/api/v1/live-view/${cameraId}/session`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/sdp' },
-  body: pc.localDescription.sdp,
-});
-if (!resp.ok) {
-  const { reason } = await resp.json().catch(() => ({}));
-  startImageFallback(cameraId, reason);
-  return;
-}
-const answerSdp = await resp.text();
-await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
-
-// 3. ICE 失敗の検出（15 秒以内に connected しない場合もフォールバック）
-const connTimeout = setTimeout(() => reportIceFailed(), 15000);
-pc.onconnectionstatechange = () => {
-  if (pc.connectionState === 'connected') {
-    clearTimeout(connTimeout);
-    showStreamingUI();
-  } else if (pc.connectionState === 'failed') {
-    clearTimeout(connTimeout);
-    reportIceFailed();
-  }
-};
-
-function reportIceFailed() {
-  fetch(`/api/v1/live-view/${cameraId}/session/${sessionId}/ice-failed`, { method: 'POST' });
-  startImageFallback(cameraId, 'ice_failed');
-}
-
-// 4. 静止画フォールバック
-function startImageFallback(cameraId, reason) {
-  showFallbackUI(reason); // 「低速モード」などの表示
-  setInterval(async () => {
-    const url = `/api/v1/live-view/${cameraId}/frame?t=${Date.now()}`;
-    document.getElementById('frame').src = url;
-  }, 5000);
-}
-```
+上記の非同期フロー（offer 送信 → sessionId 即時受信 → answer ポーリング → ICE 確立、失敗時は
+ice-failed 報告して静止画フォールバックへ）を実装した正式なクライアント SDK が
+`mocula-backend` リポジトリの `client/live-viewer/MoculaLiveViewer.ts` にある
+（`client/examples/vanilla/live-view.html`、`client/examples/react/` にサンプルあり）。
+自前実装する場合はこちらを正本として参照すること。ここに古いコード例を重複して置かないのは、
+実装が変わった際にこのドキュメントだけが取り残されて食い違う事故を防ぐため。
 
 ---
 
@@ -245,7 +215,7 @@ function startImageFallback(cameraId, reason) {
 | エンドポイント | 用途 |
 |--------------|------|
 | `stun:stun.l.google.com:19302` | カメラ側（mocula_live.sh が生成する go2rtc 設定 `ice_servers` の既定値） |
-| `stun:stun.l.google.com:19302` + `stun:stun.cloudflare.com:3478` | ブラウザ側 |
+| `stun:stun.l.google.com:19302` | ブラウザ側（`MoculaLiveViewer` の既定 `rtcConfig`。呼び出し側は `rtcConfig` オプションで追加のSTUN/TURNを指定可能） |
 
 カメラ側の STUN サーバーは `mocula_live.sh` が生成する go2rtc 設定（`ice_servers`）で指定する。既定は `stun.l.google.com`。
 
@@ -274,7 +244,7 @@ function startImageFallback(cameraId, reason) {
 |-----|----|------|
 | /status・/offer エンドポイント | 通常の短時間リクエスト | 常時ロングポーリング廃止によりアイドル接続は無い |
 | /live-frame エンドポイント | メモリ or 短 TTL キャッシュのみ | S3 等への書き込みは不要、最新 1 フレームのみ保持 |
-| セッション最大時間 | 任意（推奨 10 分） | カメラ側は `live_sessionMax`（既定 600 秒）で自動終了 |
+| セッション最大時間 | 任意（推奨 10 分） | カメラ側は `live_sessionMax`（既定 600 秒、P2P+画像フォールバック合算）で自動終了。再接続には新規セッション作成が必要 |
 
 ### カメラ側設定（/media/mmc/mconfig）
 
@@ -284,9 +254,9 @@ function startImageFallback(cameraId, reason) {
 [live]
 disabled=0       # 1 にするとモジュール全体を無効化
 idleTimeout=120  # ビューア不在で何秒後にスタックを停止するか
-imageMax=600     # 静止画モードの最大継続時間（秒）
 sessionPoll=10   # セッション中の state/consumers 報告間隔（秒）
-sessionMax=600   # 1 セッションの最大継続時間（秒）
+sessionMax=600   # 1 セッション(配信開始から、P2P+画像フォールバック合算)の最大継続時間（秒）。
+                 # 超過すると自動切断され、視聴には新規セッションでの再接続が必要
 ```
 
 `pollTimeout` はアイドルロングポーリング廃止により削除。
@@ -299,7 +269,7 @@ WebUI から RTSP を有効にするとポート 8554 が使用中になるた�
 
 ### 繰り返し P2P 失敗するカメラ
 
-CGNAT や symmetric NAT 環境では P2P が常に失敗する。この場合、バックエンドはカメラを「フォールバック専用」とマークし、offer を送らずに直接 `image` アクションを返すことを推奨する。これにより毎回 25 秒のネゴシエーション待機をスキップできる。
+CGNAT や symmetric NAT 環境では P2P が常に失敗する。この場合、バックエンドはカメラを「フォールバック専用」とマークし、offer を送らずに直接 `image` アクションを返すことを推奨する。これにより毎回最大 30〜60 秒のネゴシエーション待機（offer取得後の応答待ちタイムアウトや ANSWERED 滞留タイムアウト）をスキップできる。
 
 ---
 

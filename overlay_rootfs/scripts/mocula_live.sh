@@ -14,6 +14,11 @@ OFFER_FILE=/tmp/mocula-live-offer.sdp
 ANSWER_FILE=/tmp/mocula-live-answer.sdp
 CURL_HDRS=/tmp/mocula-live-headers.txt
 
+# live_sessionMax (mconfig) 未設定時の既定値。配信開始(session start)からの合計経過秒数の上限。
+# WebRTC P2P・画像フォールバックいずれのモードで過ごした時間も合算してこの値に達すると
+# 自動切断する(再接続には新規セッション作成が必要)。後で変更する場合はここだけ変える。
+DEFAULT_LIVE_SESSION_MAX=600
+
 log() {
   echo "$(date +"%Y/%m/%d %H:%M:%S") : $*" >> "$LOGFILE"
 }
@@ -35,9 +40,8 @@ load_config() {
   DEBUG_MODE="${global_debug:-0}"
   LIVE_DISABLED="${live_disabled:-0}"
   LIVE_IDLE_TIMEOUT="${live_idleTimeout:-120}"
-  LIVE_IMAGE_MAX="${live_imageMax:-600}"
   LIVE_SESSION_POLL="${live_sessionPoll:-10}"
-  LIVE_SESSION_MAX="${live_sessionMax:-600}"
+  LIVE_SESSION_MAX="${live_sessionMax:-$DEFAULT_LIVE_SESSION_MAX}"
 }
 
 # returns 0 (true) if a go2rtc/v4l2rtspserver not started by us is running
@@ -52,14 +56,25 @@ stack_start() {
     return 1
   fi
   if [ -f "$STACK_MARKER" ]; then
-    # マーカーが残っていても異常終了の残骸の可能性があるため、go2rtc の応答を実際に確認する
-    curl -s -o /dev/null -m 2 "http://127.0.0.1:1984/api" 2>/dev/null && return 0
-    log "stack_start: stale stack marker detected, cleaning up"
+    # マーカーが残っていても異常終了の残骸の可能性があるため、go2rtc の応答を実際に確認する。
+    # http_code を明示比較し、4xx/5xx (エラー応答はあるがプロセスは死んでいない状態) を
+    # 「生きている」と誤判定しないようにする。curl 自体の接続失敗(タイムアウト等)は http_code が
+    # 空/000 になるため、HTTPエラー応答と区別してログに残せる。
+    local stale_check_http_code
+    stale_check_http_code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:1984/api" 2>/dev/null)
+    [ "$stale_check_http_code" = "200" ] && return 0
+    log "stack_start: stale stack marker detected (http=${stale_check_http_code:-000}), cleaning up"
     _stack_stop_internal
   fi
 
   log "stack_start: enabling video encoder ch0"
-  /scripts/cmd video 0 on > /dev/null 2>&1
+  # on の失敗は stack_start 自体を中断させる致命的な失敗なので log (常時記録)。
+  # off はここより下の複数のクリーンアップ経路(失敗時・正常終了時)から呼ばれるベストエフォートの
+  # 後片付けであり、それ自体の失敗で処理を止める意味がないため log_debug に留めている。
+  if ! /scripts/cmd video 0 on > /dev/null 2>&1; then
+    log "stack_start: cmd video 0 on failed"
+    return 1
+  fi
 
   # Wait for port 8554 to be free
   local i=0
@@ -79,7 +94,7 @@ stack_start() {
   done
   if ! pidof v4l2rtspserver > /dev/null 2>&1; then
     log "stack_start: v4l2rtspserver failed to start"
-    /scripts/cmd video 0 off > /dev/null 2>&1
+    /scripts/cmd video 0 off > /dev/null 2>&1 || log_debug "stack_start: cmd video 0 off failed (cleanup)"
     return 1
   fi
 
@@ -104,14 +119,18 @@ YAML
   log "stack_start: starting go2rtc"
   /usr/bin/go2rtc -config "$GO2RTC_CONFIG" >> /tmp/log/go2rtc-mocula.log 2>&1 &
 
+  # http_code を明示比較し、4xx/5xx (プロセスは起きているがAPIがエラーを返している状態) を
+  # 「準備完了」と誤判定しないようにする。curl 自体の接続失敗とHTTPエラー応答をログで区別できる。
+  local go2rtc_http_code
   i=0
   while [ $i -lt 20 ]; do
-    curl -s -o /dev/null -m 2 "http://127.0.0.1:1984/api" 2>/dev/null && break
+    go2rtc_http_code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:1984/api" 2>/dev/null)
+    [ "$go2rtc_http_code" = "200" ] && break
     sleep 0.5
     i=$((i + 1))
   done
-  if ! curl -s -o /dev/null -m 2 "http://127.0.0.1:1984/api" 2>/dev/null; then
-    log "stack_start: go2rtc API not ready"
+  if [ "$go2rtc_http_code" != "200" ]; then
+    log "stack_start: go2rtc API not ready (http=${go2rtc_http_code:-000})"
     _stack_stop_internal
     return 1
   fi
@@ -122,7 +141,7 @@ YAML
 }
 
 _stack_stop_internal() {
-  /scripts/cmd video 0 off > /dev/null 2>&1
+  /scripts/cmd video 0 off > /dev/null 2>&1 || log_debug "_stack_stop_internal: cmd video 0 off failed"
   local i=0
   while pidof go2rtc > /dev/null 2>&1 && [ $i -lt 10 ]; do
     killall go2rtc > /dev/null 2>&1
@@ -135,6 +154,12 @@ _stack_stop_internal() {
     sleep 0.5
     i=$((i + 1))
   done
+  # kill 試行後も生き残っていれば、その旨を記録する。ここで無言のまま STACK_MARKER を
+  # 消すと、次回 stack_start 時に foreign_stack_running が「見知らぬプロセスがいる」と
+  # 誤誘導するログを出す(実際の原因はここでの停止漏れなのに気づけなくなる)。
+  if pidof go2rtc > /dev/null 2>&1 || pidof v4l2rtspserver > /dev/null 2>&1; then
+    log "_stack_stop_internal: WARNING process still alive after kill attempts (go2rtc=$(pidof go2rtc 2>/dev/null) v4l2rtspserver=$(pidof v4l2rtspserver 2>/dev/null))"
+  fi
   rm -f "$STACK_MARKER" "$GO2RTC_CONFIG"
 }
 
@@ -145,9 +170,22 @@ stack_stop() {
   log "stack_stop: done"
 }
 
+# 戻り値: 0=consumerあり, 1=consumerなし(確認できた), 2=go2rtc への問い合わせ自体が失敗(不明)。
+# 呼び出し側は 2 を「consumerなし」と混同しないこと(視聴中セッションの誤切断につながる)。
 has_consumers() {
+  local body_file="/tmp/mocula-live-streams.json"
+  local http_code result
+  http_code=$(curl -s -m 5 -o "$body_file" -w '%{http_code}' "http://127.0.0.1:1984/api/streams" 2>/dev/null)
+  if [ "$http_code" != "200" ]; then
+    log_debug "has_consumers: go2rtc API unreachable (http=$http_code)"
+    rm -f "$body_file"
+    return 2
+  fi
   # Non-empty consumers array: "consumers":[{...}]
-  curl -s -m 5 "http://127.0.0.1:1984/api/streams" 2>/dev/null | grep -q '"consumers":\[{'
+  grep -q '"consumers":\[{' "$body_file"
+  result=$?
+  rm -f "$body_file"
+  return $result
 }
 
 # offer SDP を単発 GET で取得する(camera-sync には SDP を載せない)
@@ -163,13 +201,25 @@ fetch_offer() {
   [ "$http_code" = "200" ] && [ -s "$OFFER_FILE" ]
 }
 
-# TODO(確認待ち): 確定プロトコルにカメラ→backend の answer 提出/エラー報告経路が
-# 明示されていない。既存の POST /answer?session=id(application/sdp, ?error=busy|stack_failed)
-# が据え置きである前提で実装している。オーケストレーターの確認後に確定させる。
+# stack_start/go2rtc 交換失敗をbackendへ報告する。この報告自体が失敗すると、backend側
+# セッションは SENT_TO_CAMERA のまま取り残される(このプロセスはここで終了し以後 /status も
+# 送らないため、offer→answer タイムアウト以外に気づく手段がない)。他のcurl呼び出しと同様に
+# http_code を検証しログを残す。
 report_answer_error() {
-  curl -s -m 15 -X POST \
-    "$API_ORIGIN/api/v1/live-signal/$TENANT_KEY/$CAMERA_KEY/answer?session=${1}&error=${2}" \
-    > /dev/null 2>&1
+  local session_id="$1"
+  local reason="$2"
+  local http_code
+  http_code=$(curl -s -m 15 -X POST \
+    -o /dev/null -w '%{http_code}' \
+    "$API_ORIGIN/api/v1/live-signal/$TENANT_KEY/$CAMERA_KEY/answer?session=${session_id}&error=${reason}" 2>/dev/null)
+  case "$http_code" in
+    2*)
+      log_debug "report_answer_error: reported reason=$reason http=$http_code"
+      ;;
+    *)
+      log "report_answer_error: FAILED to report reason=$reason http=$http_code session=$session_id"
+      ;;
+  esac
 }
 
 # OFFER_FILE の offer を go2rtc に渡して answer を得て backend に提出する
@@ -251,22 +301,27 @@ session_status() {
       STATUS_ACTION="gone"
       ;;
     *)
-      log_debug "session_status: http=$http_code"
+      # curl 自体の失敗(000/空)や 5xx 等の真の異常系。DEBUG_MODE 無しでも追えるよう記録する。
+      # STATUS_ACTION は空のままなので run_session 側の case はどれにもマッチせず継続する
+      # (一過性の障害を想定した挙動だが、繰り返す場合はここのログが唯一の手がかりになる)。
+      log "session_status: unexpected response http=$http_code session=$session_id"
       ;;
   esac
 }
 
+# $2 には run_session 側で既に経過した秒数(session_sec)を渡す。P2P区間+画像区間の
+# 合計経過時間で LIVE_SESSION_MAX を判定するため、ここで 0 にリセットしてはならない。
 image_mode() {
   local session_id="$1"
-  local elapsed=0
+  local elapsed="${2:-0}"
   local fail_count=0
   local post_fail=0
   local frame_file="/tmp/mocula-live-frame.jpg"
   local action http_code
 
-  log "image_mode: starting session=$session_id"
+  log "image_mode: starting session=$session_id elapsed=${elapsed}s"
 
-  while [ $elapsed -lt "$LIVE_IMAGE_MAX" ]; do
+  while [ $elapsed -lt "$LIVE_SESSION_MAX" ]; do
     /scripts/cmd jpeg 1 | sed '1,3d' > "$frame_file"
     # JPEG マジックバイト(ff d8)を確認し、cmd のエラー出力等をフレームとして送らない
     # (BusyBox od は -A/-t/-N 非対応のため od -b を使う)
@@ -316,6 +371,8 @@ image_mode() {
     elapsed=$((elapsed + 5))
   done
 
+  [ $elapsed -ge "$LIVE_SESSION_MAX" ] && log "session: max duration reached"
+
   rm -f "$frame_file"
   log "image_mode: ended elapsed=${elapsed}s"
 }
@@ -325,7 +382,7 @@ run_session() {
   local session_id="$1"
   local idle_sec=0
   local session_sec=0
-  local consumers
+  local consumers=0
 
   log "session start id=$session_id"
   log_debug "config: origin=$API_ORIGIN tenant=$TENANT_KEY camera=$CAMERA_KEY sessionPoll=$LIVE_SESSION_POLL"
@@ -351,17 +408,29 @@ run_session() {
       break
     fi
 
-    if has_consumers; then
-      idle_sec=0
-      consumers=1
-    else
-      idle_sec=$((idle_sec + LIVE_SESSION_POLL))
-      consumers=0
-      if [ $idle_sec -ge "$LIVE_IDLE_TIMEOUT" ]; then
-        log "session: idle timeout (no consumers)"
-        break
-      fi
-    fi
+    has_consumers
+    case $? in
+      0)
+        idle_sec=0
+        consumers=1
+        ;;
+      1)
+        idle_sec=$((idle_sec + LIVE_SESSION_POLL))
+        consumers=0
+        if [ $idle_sec -ge "$LIVE_IDLE_TIMEOUT" ]; then
+          log "session: idle timeout (no consumers)"
+          break
+        fi
+        ;;
+      *)
+        # go2rtc への問い合わせ自体が失敗(一時的な負荷等)。実際に視聴者がいなくなったのかは
+        # 分からないため、idle_sec は進めず直前の consumers 値のまま次周期へ進む
+        # (誤って視聴中セッションをアイドルタイムアウトで切断しないため)。session_status の
+        # 異常系と同様、DEBUG_MODE 無しでも追えるよう記録する (go2rtc がフリーズしたまま
+        # pidof のクラッシュ検知をすり抜けるケースを本番でも発見できるようにするため)。
+        log "session: has_consumers query failed, keeping previous idle state"
+        ;;
+    esac
 
     session_status "$session_id" "streaming" "$consumers"
     case "$STATUS_ACTION" in
@@ -375,7 +444,7 @@ run_session() {
         ;;
       image)
         log "session: image fallback requested"
-        image_mode "$session_id"
+        image_mode "$session_id" "$session_sec"
         break
         ;;
     esac
