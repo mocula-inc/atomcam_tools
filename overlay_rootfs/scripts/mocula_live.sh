@@ -222,6 +222,27 @@ report_answer_error() {
   esac
 }
 
+# カメラが backend からの stop/gone 指示を経ずに自発的にセッションを終える経路
+# (LIVE_SESSION_MAX 到達) で呼ぶ。呼ばなければ backend 側セッションが CLOSED に
+# 遷移せず、カメラ単位ロックが LOCK_TTL_MARGIN_SECONDS(backend 側定数)の猶予いっぱいまで
+# 残留し、その間ブラウザは image フォールバックへ倒れたまま何のフレームも受け取れなくなる。
+# 通知自体が失敗しても最終的にはロックが自然に失効するため retry はしない (ベストエフォート)。
+report_session_ended() {
+  local session_id="$1"
+  local http_code
+  http_code=$(curl -s -m 15 -X POST \
+    -o /dev/null -w '%{http_code}' \
+    "$API_ORIGIN/api/v1/live-signal/$TENANT_KEY/$CAMERA_KEY/end?session=${session_id}" 2>/dev/null)
+  case "$http_code" in
+    2*)
+      log_debug "report_session_ended: reported http=$http_code"
+      ;;
+    *)
+      log "report_session_ended: FAILED to report http=$http_code session=$session_id"
+      ;;
+  esac
+}
+
 # OFFER_FILE の offer を go2rtc に渡して answer を得て backend に提出する
 handle_offer() {
   local session_id="$1"
@@ -331,6 +352,7 @@ image_mode() {
       log_debug "image_mode: capture failed count=$fail_count"
       if [ $fail_count -ge 5 ]; then
         log "image_mode: JPEG capture failed ${fail_count} times, aborting"
+        report_session_ended "$session_id"
         break
       fi
       sleep 5
@@ -358,6 +380,10 @@ image_mode() {
         log "image_mode: frame post failed http=$http_code count=$post_fail"
         if [ $post_fail -ge 5 ]; then
           log "image_mode: frame post failed ${post_fail} times, aborting"
+          # post 自体が失敗し続けている状況なので report_session_ended も届かない可能性が高いが、
+          # 呼び出し自体は idempotent (既に消えているセッションに対しては何もしない) なので
+          # 無条件に試みる。届けば即座にロックが解放される。
+          report_session_ended "$session_id"
           break
         fi
         ;;
@@ -371,7 +397,10 @@ image_mode() {
     elapsed=$((elapsed + 5))
   done
 
-  [ $elapsed -ge "$LIVE_SESSION_MAX" ] && log "session: max duration reached"
+  if [ $elapsed -ge "$LIVE_SESSION_MAX" ]; then
+    log "session: max duration reached"
+    report_session_ended "$session_id"
+  fi
 
   rm -f "$frame_file"
   log "image_mode: ended elapsed=${elapsed}s"
@@ -452,6 +481,7 @@ run_session() {
     session_sec=$((session_sec + LIVE_SESSION_POLL))
     if [ $session_sec -ge "$LIVE_SESSION_MAX" ]; then
       log "session: max duration reached"
+      report_session_ended "$session_id"
       break
     fi
     sleep "$LIVE_SESSION_POLL"
