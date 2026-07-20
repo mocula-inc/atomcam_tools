@@ -434,6 +434,10 @@ run_session() {
     if [ -f "$STACK_MARKER" ] && \
        { ! pidof go2rtc > /dev/null 2>&1 || ! pidof v4l2rtspserver > /dev/null 2>&1; }; then
       log "session: stack died unexpectedly"
+      # idleTimeout到達時(下記)と同じ理由で、ここで report_session_ended を呼ばないと
+      # backend がクラッシュに気づかず、カメラ単位ロックが offer 取得時刻+720秒まで
+      # 解放されない。go2rtc/v4l2rtspserver が異常終了した場合も自発終了として扱う。
+      report_session_ended "$session_id"
       break
     fi
 
