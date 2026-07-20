@@ -448,6 +448,11 @@ run_session() {
         consumers=0
         if [ $idle_sec -ge "$LIVE_IDLE_TIMEOUT" ]; then
           log "session: idle timeout (no consumers)"
+          # sessionMax到達時と異なりここまで report_session_ended を呼んでいなかったため、
+          # backend はカメラが止まったことを知らずセッションを CONNECTED 等のまま残す。
+          # 結果、カメラ単位ロックが offer 取得時刻+720秒まで解放されず、実機は既に
+          # アイドルなのに新規視聴者が誤って 409 で拒否され続ける (実機で実際に確認済み)。
+          report_session_ended "$session_id"
           break
         fi
         ;;
