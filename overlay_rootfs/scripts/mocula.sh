@@ -251,8 +251,6 @@ camera_sync() {
       if(key == "checkInterval") printf "CHECK_INTERVAL=%s\n", val
       if(key == "firstUploadDelay") printf "FIRST_UPLOAD_DELAY=%s\n", val
       if(key == "serverEpoch") printf "SERVER_EPOCH=%s\n", val
-      if(key == "uptimeStart") printf "UPTIME_START=%s\n", val
-      if(key == "uptimeEnd") printf "UPTIME_END=%s\n", val
     }
   }')
   # firstUploadDelay を返さない旧サーバとの互換のため、未取得なら即時アップロード
@@ -265,12 +263,18 @@ camera_sync() {
   parse_firmware_update_offer
   sync_clock_from_server
 
-  # ライブ開始シグナル(liveAction/liveSessionId)は脆い汎用パーサを通さず専用抽出する。
-  # backend は常にスカラの両キーを返す約束(SDP 等は載せない)なので狙い撃ちの sed で安全に読める。
+  # liveAction/liveSessionId/uptimeStart/uptimeEnd は脆い汎用パーサ(eval)を通さず専用抽出する。
+  # 上の eval はレスポンス中の値をシェルへそのまま展開するため、値にシェルメタ文字が
+  # 含まれると任意コマンド実行を許してしまう(コマンドインジェクション)。backend は
+  # これらを常にスカラで返す約束(SDP等は載せない)なので、狙い撃ちの sed で安全に読める。
+  # uptimeStart/uptimeEnd は数字のみを許可することで、不正な値が入っても(空になるだけで)
+  # 後段の expr/[ の評価がクラッシュしたりインジェクションされたりしない。
   LIVE_ACTION=$(echo "$RESPONSE" | sed -n 's/.*"liveAction":"\([^"]*\)".*/\1/p')
   LIVE_SESSION=$(echo "$RESPONSE" | sed -n 's/.*"liveSessionId":"\([^"]*\)".*/\1/p')
+  UPTIME_START=$(echo "$RESPONSE" | sed -n 's/.*"uptimeStart":"\{0,1\}\([0-9]*\)"\{0,1\}.*/\1/p')
+  UPTIME_END=$(echo "$RESPONSE" | sed -n 's/.*"uptimeEnd":"\{0,1\}\([0-9]*\)"\{0,1\}.*/\1/p')
   [ -z "$LIVE_ACTION" ] && LIVE_ACTION="none"
-  log_debug "camera_sync: liveAction=$LIVE_ACTION liveSessionId=$LIVE_SESSION"
+  log_debug "camera_sync: liveAction=$LIVE_ACTION liveSessionId=$LIVE_SESSION uptimeStart=$UPTIME_START uptimeEnd=$UPTIME_END"
 }
 
 next_upload_url() {
@@ -466,6 +470,19 @@ backup_current_firmware() {
   return 0
 }
 
+# mocula_live.sh をエラー出力を握りつぶさずに呼ぶ。呼び出し元は結果を待たない
+# (>/dev/null 2>&1) 運用だったため、mocula_live.sh が自身の log() に到達する前に
+# 落ちた場合(スクリプト破損・permission denied・exec format error 等)、どこにも
+# 痕跡が残らなかった。非ゼロ終了時はここで mocula.log に残す。
+call_mocula_live() {
+  MOCULA_LIVE_OUTPUT=$(/scripts/mocula_live.sh "$@" 2>&1)
+  MOCULA_LIVE_EXIT=$?
+  if [ $MOCULA_LIVE_EXIT -ne 0 ]; then
+    log "mocula_live.sh $* failed (exit=$MOCULA_LIVE_EXIT): $MOCULA_LIVE_OUTPUT"
+  fi
+  return $MOCULA_LIVE_EXIT
+}
+
 run_daemon() {
   [ -f $MCONFIG ] || exit 0
   load_config
@@ -502,7 +519,7 @@ run_daemon() {
       if [ "$LIVE_ACTION" = "offer" ] && [ -n "$LIVE_SESSION" ] && [ "$LIVE_SESSION" != "$LAST_LIVE_SESSION" ]; then
         LAST_LIVE_SESSION="$LIVE_SESSION"
         log "live start trigger session=$LIVE_SESSION"
-        /scripts/mocula_live.sh start "$LIVE_SESSION" > /dev/null 2>&1 &
+        (call_mocula_live start "$LIVE_SESSION") &
       fi
       CONFIG_COUNTER=0
       if [ -n "$URL_QUEUE" ]; then
@@ -563,11 +580,11 @@ case "$1" in
     stop_daemon > /dev/null 2>&1
     run_daemon &
     echo $! > $PIDFILE
-    /scripts/mocula_live.sh on > /dev/null 2>&1
+    call_mocula_live on
     ;;
   off)
     touch $DISABLEFILE
-    /scripts/mocula_live.sh off > /dev/null 2>&1
+    call_mocula_live off
     stop_daemon
     log "mocula stopped"
     ;;
@@ -577,12 +594,12 @@ case "$1" in
     [ -f $MCONFIG ] || exit 0
     run_daemon &
     echo $! > $PIDFILE
-    /scripts/mocula_live.sh restart > /dev/null 2>&1
+    call_mocula_live restart
     ;;
   watchdog)
     [ -f $MCONFIG ] || exit 0
     [ -f $DISABLEFILE ] && exit 0
-    /scripts/mocula_live.sh watchdog > /dev/null 2>&1
+    call_mocula_live watchdog
     if [ -f $PIDFILE ]; then
       PID=$(cat $PIDFILE)
       if kill -0 "$PID" > /dev/null 2>&1; then

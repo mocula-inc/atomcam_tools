@@ -78,10 +78,16 @@ stack_start() {
 
   # Wait for port 8554 to be free
   local i=0
-  while netstat -ltn 2>/dev/null | grep -q ':8554 ' && [ $i -lt 10 ]; do
-    sleep 0.5
-    i=$((i + 1))
-  done
+  if ! command -v netstat > /dev/null 2>&1; then
+    # netstat 自体が無いと "ポート空き" と "確認不能" を区別できず、後続の
+    # v4l2rtspserver 起動失敗時に本当の原因(ポート未解放)が見えなくなる。
+    log "stack_start: netstat not available, skipping port-8554 wait"
+  else
+    while netstat -ltn 2>/dev/null | grep -q ':8554 ' && [ $i -lt 10 ]; do
+      sleep 0.5
+      i=$((i + 1))
+    done
+  fi
 
   log "stack_start: starting v4l2rtspserver"
   # URL = {device_basename}_{default_unicast} = video0_unicast (no -u flag needed)
@@ -188,17 +194,18 @@ has_consumers() {
   return $result
 }
 
-# offer SDP を単発 GET で取得する(camera-sync には SDP を載せない)
+# offer SDP を単発 GET で取得する(camera-sync には SDP を載せない)。
+# http_code は呼び出し元がログに含められるよう FETCH_OFFER_HTTP_CODE に残す
+# (session_status 等と同様のグローバル出力パターン)。
 fetch_offer() {
   local session_id="$1"
-  local http_code
   rm -f "$OFFER_FILE"
-  http_code=$(curl -s -m 15 -X GET \
+  FETCH_OFFER_HTTP_CODE=$(curl -s -m 15 -X GET \
     -o "$OFFER_FILE" \
     -w '%{http_code}' \
     "$API_ORIGIN/api/v1/live-signal/$TENANT_KEY/$CAMERA_KEY/offer?session=${session_id}" 2>/dev/null)
-  log_debug "fetch_offer: http=$http_code size=$(wc -c < "$OFFER_FILE" 2>/dev/null)"
-  [ "$http_code" = "200" ] && [ -s "$OFFER_FILE" ]
+  log_debug "fetch_offer: http=$FETCH_OFFER_HTTP_CODE size=$(wc -c < "$OFFER_FILE" 2>/dev/null)"
+  [ "$FETCH_OFFER_HTTP_CODE" = "200" ] && [ -s "$OFFER_FILE" ]
 }
 
 # stack_start/go2rtc 交換失敗をbackendへ報告する。この報告自体が失敗すると、backend側
@@ -349,7 +356,9 @@ image_mode() {
     if [ ! -s "$frame_file" ] || \
        [ "$(head -c 2 "$frame_file" | od -b | awk 'NR==1{print $2 $3}')" != "377330" ]; then
       fail_count=$((fail_count + 1))
-      log_debug "image_mode: capture failed count=$fail_count"
+      # 5回未満で回復する断続的な失敗も、DEBUG_MODE 無しで追えるよう記録する
+      # (閾値未満のフラッピングは以前 log_debug のみで、本番では痕跡が残らなかった)。
+      log "image_mode: capture failed count=$fail_count"
       if [ $fail_count -ge 5 ]; then
         log "image_mode: JPEG capture failed ${fail_count} times, aborting"
         report_session_ended "$session_id"
@@ -420,7 +429,7 @@ run_session() {
   [ -f "$STACK_MARKER" ] && _stack_stop_internal
 
   if ! fetch_offer "$session_id"; then
-    log "session: offer fetch failed id=$session_id"
+    log "session: offer fetch failed id=$session_id http=${FETCH_OFFER_HTTP_CODE:-000}"
     return 1
   fi
 
@@ -535,8 +544,15 @@ case "$1" in
     log "mocula-live stopped"
     ;;
   on)
-    # 常駐は無くオンデマンド起動なので、disable 解除のみ行う
-    rm -f "$DISABLEFILE"
+    # 常駐は無くオンデマンド起動なので、disable 解除のみ行う。他の分岐(off/restart/watchdog)
+    # は結果をログに残すのに対し、ここだけ無言だった。SD カードが read-only 等で rm -f が
+    # 実際には解除できていない場合に痕跡が残らず、再度 on にしたのに配信が復活しないまま
+    # 気づけない事態を防ぐ。
+    if rm -f "$DISABLEFILE"; then
+      log "mocula-live enabled"
+    else
+      log "mocula-live: failed to remove $DISABLEFILE"
+    fi
     ;;
   restart)
     # 実行中セッションを停止する(次の camera-sync トリガで再開される)
