@@ -8,6 +8,8 @@ export interface FirmwareDeployConfig {
     region?: string;
   };
   imageBucketName: string;
+  /** ファームウェア登録API のベースURL。CDK では使わず buildscripts/register_firmware.sh が読む */
+  apiOrigin?: string;
 }
 
 export function loadConfig(stage: string): FirmwareDeployConfig {

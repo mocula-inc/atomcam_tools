@@ -1,2 +1,6 @@
 # mocula-backend の cdk/config/prod2.yml の s3.imageBucketName と同じ値を指定する
 imageBucketName: "store.prod2.apne1.mocula.jp"
+
+# ファームウェア登録API(POST /api/v1/admin/firmwares)のベースURL。
+# mocula-backend の cdk/config/prod2.yml の cloudfront.domainName と同じホストを指定する
+apiOrigin: "https://cloud.mocula.jp"

@@ -293,6 +293,43 @@ cron から毎分呼ばれ、`PHASE=applied` のときだけ動く。
 2026/07/30 12:18:01 : fwrollback: backup verification failed, cannot roll back; reporting rollback_failed
 ```
 
+### 配信手順
+
+```sh
+echo "0.4.0" > configs/mocula.ver      # 唯一のバージョン定義元。必ずビルド前に更新する
+make build
+
+export MOCULA_ADMIN_EMAIL=you@mocula.co.jp
+make firmware-deploy CONFIG=dev1      # dev1 | qa1 | prod1 | prod2
+```
+
+`firmware-deploy` は次の2段を順に実行する。S3 に置くだけではカメラへ配信できない。
+
+| ターゲット          | 内容                                                                |
+| ------------------- | ------------------------------------------------------------------- |
+| `firmware-upload`   | CDK で `firmware/ota/{version}/atomcam_tools.zip` へ配置             |
+| `firmware-register` | `POST /api/v1/admin/firmwares` で登録（size と sha256 はサーバが算出） |
+
+配置先バケットと API のURLは `cdk/config/{stage}.yml` の `imageBucketName` / `apiOrigin`
+で、いずれも mocula-backend 側の `s3.imageBucketName` / `cloudfront.domainName` に対応する。
+
+`MOCULA_ADMIN_PASSWORD` を設定しない場合は対話的に入力を求める（CI では設定しておく）。
+ローカル開発では `MOCULA_API_ORIGIN=http://localhost:3000` を指定する。
+
+登録だけをやり直したい場合は `make firmware-register CONFIG=dev1`。
+配置済みのバージョンを再登録すると 409 になるので、その場合は先に
+`DELETE /api/v1/admin/firmwares/{id}` で登録を削除する。
+
+登録後、カメラごとに予約すると配信が始まる。
+
+```
+POST   /api/v1/cameras/{cameraId}/firmware-update   {"firmwareId": N}
+GET    /api/v1/cameras/{cameraId}/firmware-update   # 進捗と失敗理由
+DELETE /api/v1/cameras/{cameraId}/firmware-update   # 取消
+```
+
+予約から `completed` までは実測で約3分。
+
 ### 動作確認
 
 `tests/test_fwrollback.sh` が `fwrollback.sh` の全分岐を検証する（busybox ash、実機不要）。
