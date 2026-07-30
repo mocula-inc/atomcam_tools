@@ -10,6 +10,7 @@ echo "Executing pre filesystem image creation script"
 
 find $TARGET_DIR -name .DS_Store -delete
 cp /src/configs/atomhack.ver $TARGET_DIR/etc
+cp /src/configs/mocula.ver $TARGET_DIR/etc
 
 DEFAULT_IMAGE_DIR="/atomtools/build/buildroot-2016.02/output/images"
 BASE_DIR=${BASE_DIR:-/atomtools/build/buildroot-2016.02/output}
