@@ -103,6 +103,22 @@ case "$REGISTER_CODE" in
     echo "==> registered:"
     cat "$BODY_FILE"
     echo
+    # サーバは S3 の実体から sha256 を算出する。手元の zip と一致しなければ、
+    # 転送が欠けたか、アップロード後に zip を作り直している
+    ZIP_FILE="$REPO_ROOT/atomcam_tools.zip"
+    if [ -f "$ZIP_FILE" ]; then
+      LOCAL_SHA=$(sha256sum "$ZIP_FILE" | awk '{print $1}')
+      REMOTE_SHA=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["checksum"])' < "$BODY_FILE")
+      if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
+        echo >&2
+        echo "error: the registered checksum does not match the local atomcam_tools.zip." >&2
+        echo "       registered: $REMOTE_SHA" >&2
+        echo "       local:      $LOCAL_SHA" >&2
+        echo "       The object in S3 is not this build. Delete the registration and redeploy." >&2
+        exit 1
+      fi
+      echo "==> checksum matches the local build"
+    fi
     echo "==> next: reserve it for a camera with POST /api/v1/cameras/{id}/firmware-update"
     ;;
   409)

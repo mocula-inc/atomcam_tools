@@ -39,10 +39,15 @@ lima:
 # 使い方: make firmware-deploy CONFIG=dev1
 firmware-deploy: firmware-upload firmware-register
 
-# S3 への配置のみ
+# S3 への配置のみ。既存オブジェクトの差し替えは既定で拒否する
 firmware-upload:
-	cd cdk && npm install && npx cdk deploy --context config=$(CONFIG) --require-approval never
+	./buildscripts/upload_firmware.sh $(CONFIG)
 
 # バックエンドへの登録のみ（配置済みのものを登録し直す場合に使う）
 firmware-register:
 	./buildscripts/register_firmware.sh $(CONFIG)
+
+# cdk/ は firmware-deploy の初期実装。配置は aws s3 cp で足りるため通常は使わないが、
+# 参考として残してある（synth の動作確認用）
+firmware-cdk-synth:
+	cd cdk && npm install && npx cdk synth --context config=$(CONFIG)
