@@ -25,3 +25,29 @@ lima:
 	[ "`uname -s`" = "Darwin" ] || exit 0
 	[ -d ~/.lima/lima-docker ] || ( limactl start --tty=false lima-docker.yml && exit 0 )
 	[ "`limactl list | awk '/lima-docker/ { print $2 }'`" = "Running" ] || limactl start lima-docker
+
+# ビルド済み atomcam_tools.zip (configs/mocula.ver のバージョン) を
+# mocula-backend の imageBucket の firmware/ota/{version}/ へ配置し、
+# 続けてバックエンドへ登録する（登録まで済まないとカメラへ予約できない）。
+#
+# 前提: 先に make build を実行し、configs/mocula.ver がその zip のバージョンと
+#       一致していること（両者の一致は検証していないので手動で確認する）。
+#       同じバージョンで再デプロイすると S3 の実体だけが差し替わり、登録済みの
+#       size/sha256 とずれて全カメラが検証失敗するため、必ずバージョンを上げる。
+# 環境変数: MOCULA_ADMIN_EMAIL / MOCULA_ADMIN_PASSWORD が必要
+#           (MOCULA_ADMIN_PASSWORD 未設定なら対話的に入力を求める)
+# 使い方: make firmware-deploy CONFIG=dev1
+firmware-deploy: firmware-upload firmware-register
+
+# S3 への配置のみ。既存オブジェクトの差し替えは既定で拒否する
+firmware-upload:
+	./buildscripts/upload_firmware.sh $(CONFIG)
+
+# バックエンドへの登録のみ（配置済みのものを登録し直す場合に使う）
+firmware-register:
+	./buildscripts/register_firmware.sh $(CONFIG)
+
+# cdk/ は firmware-deploy の初期実装。配置は aws s3 cp で足りるため通常は使わないが、
+# 参考として残してある（synth の動作確認用）
+firmware-cdk-synth:
+	cd cdk && npm install && npx cdk synth --context config=$(CONFIG)
