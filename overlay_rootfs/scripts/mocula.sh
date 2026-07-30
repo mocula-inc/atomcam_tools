@@ -4,9 +4,32 @@ PIDFILE=/var/run/mocula.pid
 DISABLEFILE=/var/run/mocula.disabled
 LOGFILE=/tmp/log/mocula.log
 MCONFIG=/media/mmc/mconfig
+# /var/run は tmpfs。起動ごとに消えることが前提で、fwrollback.sh は「更新後の起動で一度でも
+# camera-sync に成功したか」の判定にこのファイルを使う。永続領域へ移してはならない。
+SYNC_OK_FILE=/var/run/mocula.sync_ok
+VERSION_FILE=/etc/mocula.ver
+UPDATE_DIR=/media/mmc/update
+BACKUP_DIR=/media/mmc/fwbackup
+STATE_DIR=/media/mmc/fwupdate
+STATE_FILE=$STATE_DIR/state
+# ファームウェア更新の記録用。$LOGFILE は /tmp(tmpfs) にあり、まさに診断したい更新再起動で
+# 消えてしまうため、更新関連のイベントだけは永続領域にも残す（logrotate 対象のファイルを使う）
+FWLOGFILE=/media/mmc/atomhack.log
+
+# stateの読み書き(load_state / write_state / set_state_phase)は fwrollback.sh・S76mocula と
+# 共有する必要があるため専用ライブラリに置いてある
+FWSTATE_DIR=$STATE_DIR
+FWSTATE_LOGFILE=$FWLOGFILE
+. /scripts/fwstate.sh
 
 log() {
   echo "$(date +"%Y/%m/%d %H:%M:%S") : $*" >> $LOGFILE
+}
+
+# 更新・ロールバック関連のイベント用。再起動を跨いで残す必要があるものだけに使う
+log_fw() {
+  log "$*"
+  echo "$(date +"%Y/%m/%d %H:%M:%S") : mocula.sh: $*" >> $FWLOGFILE 2>/dev/null
 }
 
 stop_daemon() {
@@ -29,11 +52,13 @@ load_config() {
   API_ORIGIN="${global_origin:-https://app.mocula.jp}"
   TENANT_KEY="$global_tenantKey"
   CAMERA_KEY="$global_cameraKey"
+  ROLLBACK_TIMEOUT="${firmware_rollbackTimeout:-600}"
 }
 
 collect_device_info() {
   WIFI_SSID=$(wpa_cli -i wlan0 status 2>/dev/null | grep '^ssid=' | cut -d= -f2)
   WIFI_RSSI=$(awk '/wlan0/ {print int($4)}' /proc/net/wireless 2>/dev/null)
+  WIFI_MAC=$(cat /sys/class/net/wlan0/address 2>/dev/null)
   IP_ADDR=$(ifconfig wlan0 2>/dev/null | grep 'inet addr' | awk '{print $2}' | cut -d: -f2)
   IP_MASK=$(ifconfig wlan0 2>/dev/null | grep 'inet addr' | awk '{print $4}' | cut -d: -f2)
   TIMESTAMP=$(awk '
@@ -43,29 +68,74 @@ collect_device_info() {
   ' /proc/stat /proc/uptime)
 }
 
+build_firmware_update_report() {
+  REPORT_JSON=""
+  load_state || return 0
+
+  case "$PHASE" in
+    failed | rolled_back | rollback_failed) ;;
+    *) return 0 ;;
+  esac
+
+  if [ -n "$REASON" ]; then
+    REPORT_JSON=$(printf ',"firmwareUpdateReport":{"targetVersion":"%s","result":"%s","reason":"%s"}' \
+      "$TARGET_VERSION" "$PHASE" "$REASON")
+  else
+    REPORT_JSON=$(printf ',"firmwareUpdateReport":{"targetVersion":"%s","result":"%s"}' "$TARGET_VERSION" "$PHASE")
+  fi
+}
+
+parse_firmware_update_offer() {
+  FW_JSON=$(echo "$RESPONSE" | sed -n 's/.*"firmwareUpdate":{\([^}]*\)}.*/\1/p')
+  if [ -n "$FW_JSON" ]; then
+    FW_VERSION=$(echo "$FW_JSON" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+    FW_URL=$(echo "$FW_JSON" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')
+    FW_SIZE=$(echo "$FW_JSON" | sed -n 's/.*"size":\([0-9]*\).*/\1/p')
+    FW_SHA=$(echo "$FW_JSON" | sed -n 's/.*"checksum":"\([a-f0-9]*\)".*/\1/p')
+  else
+    FW_VERSION=""
+    FW_URL=""
+    FW_SIZE=""
+    FW_SHA=""
+  fi
+}
+
 camera_sync() {
   collect_device_info
+  FW_CURRENT=$(cat "$VERSION_FILE" 2>/dev/null)
+  FW_VERSION_JSON=""
+  [ -n "$FW_CURRENT" ] && FW_VERSION_JSON=$(printf ',"firmwareVersion":"%s"' "$FW_CURRENT")
+  build_firmware_update_report
+
   RESPONSE=$(curl --silent --max-time 30 \
     -X POST -H 'Content-Type: application/json' \
-    -d "$(printf '{"wifi":{"ssid":"%s","rssi":%s},"ip":{"address":"%s","netmask":"%s"},"timestamp":%s}' \
-      "$WIFI_SSID" "${WIFI_RSSI:-0}" "$IP_ADDR" "$IP_MASK" "$TIMESTAMP")" \
+    -d "$(printf '{"wifi":{"ssid":"%s","rssi":%s,"mac":"%s"},"ip":{"address":"%s","netmask":"%s"},"timestamp":%s%s%s}' \
+      "$WIFI_SSID" "${WIFI_RSSI:-0}" "$WIFI_MAC" "$IP_ADDR" "$IP_MASK" "$TIMESTAMP" "$FW_VERSION_JSON" "$REPORT_JSON")" \
     "${API_ORIGIN}/api/v1/camera-sync/${TENANT_KEY}/${CAMERA_KEY}")
   CURL_EXIT=$?
   if [ $CURL_EXIT -ne 0 ]; then
     log "camera-sync failed: curl error $CURL_EXIT"
     URL_QUEUE=""
+    FW_URL=""
     return 1
   fi
   if [ -z "$RESPONSE" ]; then
     log "camera-sync failed: empty response"
     URL_QUEUE=""
+    FW_URL=""
     return 1
   fi
   if ! echo "$RESPONSE" | grep -q '"success":true'; then
     log "camera-sync failed: $RESPONSE"
     URL_QUEUE=""
+    FW_URL=""
     return 1
   fi
+
+  touch "$SYNC_OK_FILE"
+  # 障害/ロールバック報告がサーバに届いたことが確認できたので、再試行ガードのstateを消す
+  [ -n "$REPORT_JSON" ] && rm -rf "$STATE_DIR"
+
   eval $(echo "$RESPONSE" | awk '{
     gsub(/[{}]/, ""); gsub(/\[/, ""); gsub(/\]/, ""); gsub(/"/, "")
     n = split($0, pairs, ",")
@@ -78,6 +148,7 @@ camera_sync() {
     }
   }')
   URL_QUEUE=$(echo "$RESPONSE" | sed 's/.*"uploadUrls":\[//; s/\].*//; s/"//g' | tr ',' '\n')
+  parse_firmware_update_offer
 }
 
 next_upload_url() {
@@ -122,6 +193,158 @@ capture_and_upload() {
   rm -rf "$TMPDIR"
 }
 
+KERNEL_IMAGE=/boot/factory_t31_ZMC6tiIDQN
+ROOTFS_IMAGE=/media/mmc/rootfs_hack.squashfs
+
+# 失敗を記録して再試行を止める。
+# 失敗の扱いは2種類に分かれる（意図的）:
+#   - ネットワーク起因(curl失敗): state を書かず次周期に再試行する。一時的な障害とみなす。
+#   - それ以外(サイズ不一致/チェックサム不一致/空き容量不足/バックアップ検証失敗):
+#     PHASE=failed を書いて再試行を止める。再試行しても同じ結果になるため。
+#     failed はサーバへ報告され、予約が reserved から外れてオファーが止まる。
+fail_firmware_update() {
+  log_fw "firmware update failed ($1): $2"
+  if ! write_state "$FW_VERSION" "$FW_CURRENT" failed "$ROLLBACK_TIMEOUT" 0 "$1"; then
+    log_fw "could not persist failure state to $STATE_FILE (SD read-only or full)"
+  fi
+}
+
+file_size_kb() {
+  SIZE_BYTES=$(wc -c < "$1" 2>/dev/null)
+  case "$SIZE_BYTES" in
+    '' | *[!0-9]*) echo 0; return 1 ;;
+  esac
+  echo $(((SIZE_BYTES + 1023) / 1024))
+}
+
+# 更新に必要な空き容量(KB)。以前は 40MB 固定だったが、それはzip単体(約46MB)よりも小さく、
+# チェックを通過してから容量不足に陥っていた。実際に同時に置かれるのは:
+#   - ダウンロードしたzip (FW_SIZE)
+#   - SDへ退避する旧カーネルと旧rootfs
+#   - 再起動後、initramfs が zip を展開する分の余裕 (zipと同程度)
+required_space_kb() {
+  ZIP_KB=$(((FW_SIZE + 1023) / 1024))
+  KERNEL_KB=$(file_size_kb "$KERNEL_IMAGE")
+  ROOTFS_KB=$(file_size_kb "$ROOTFS_IMAGE")
+  # 10% を余裕として乗せる
+  echo $(((ZIP_KB * 2 + KERNEL_KB + ROOTFS_KB) * 110 / 100))
+}
+
+free_space_kb() {
+  # デバイス名が長いと df が2行に折り返すため、マウントポイント行から取り出す
+  FREE=$(df /media/mmc 2>/dev/null | awk '$NF=="/media/mmc"{print $(NF-2)}')
+  case "$FREE" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  echo "$FREE"
+}
+
+apply_firmware_update() {
+  [ -z "$FW_URL" ] && return 0
+  [ -z "$FW_VERSION" ] && return 0
+  [ -z "$FW_SIZE" ] && return 0
+  [ -z "$FW_SHA" ] && return 0
+  [ "$FW_VERSION" = "$FW_CURRENT" ] && return 0
+  # state が残っている間は同一バージョンを再ダウンロードしない。
+  # サーバは予約が reserved の間、毎回同じオファーを返す（配信保証のための意図的な仕様）ため、
+  # このガードで重複ダウンロードを弾く。恒久的な再試行停止はサーバ側が担う。
+  [ "$FW_VERSION" = "$TARGET_VERSION" ] && return 0
+
+  # 現在のバージョンが読めない状態で更新すると、再起動後に完了判定もロールバック判定も
+  # できなくなり、同じ更新を延々と繰り返す
+  if [ -z "$FW_CURRENT" ]; then
+    log_fw "firmware update skipped: cannot read current version from $VERSION_FILE"
+    return 1
+  fi
+
+  # state ファイルに書ける文字だけを受け付ける。想定外の文字を含むバージョンをそのまま
+  # 扱うと、state が壊れていると判定されて破棄され、ロールバック監視が無効になる
+  case "$FW_VERSION" in
+    '' | *[!A-Za-z0-9._-]*)
+      fail_firmware_update invalid_version "server offered an unusable version string"
+      return 1
+      ;;
+  esac
+
+  NEED_KB=$(required_space_kb)
+  FREE_KB=$(free_space_kb)
+  if [ -z "$FREE_KB" ]; then
+    fail_firmware_update df_unreadable "cannot determine free space on /media/mmc"
+    return 1
+  fi
+  if [ "$FREE_KB" -lt "$NEED_KB" ]; then
+    fail_firmware_update insufficient_space "need ${NEED_KB}KB, have ${FREE_KB}KB"
+    return 1
+  fi
+
+  mkdir -p "$UPDATE_DIR"
+  TMP_ZIP="$UPDATE_DIR/atomcam_tools.zip.tmp"
+  rm -f "$TMP_ZIP"
+  curl -L --max-time 600 --silent -o "$TMP_ZIP" "$FW_URL"
+  CURL_EXIT=$?
+  if [ $CURL_EXIT -ne 0 ] || [ ! -f "$TMP_ZIP" ]; then
+    # ネットワーク起因の失敗は一時的な可能性があるため state は書かず、次周期に再試行する
+    log "firmware download failed: curl error $CURL_EXIT"
+    rm -f "$TMP_ZIP"
+    return 1
+  fi
+
+  ACTUAL_SIZE=$(wc -c < "$TMP_ZIP")
+  if [ "$ACTUAL_SIZE" -ne "$FW_SIZE" ] 2>/dev/null; then
+    rm -f "$TMP_ZIP"
+    fail_firmware_update size_mismatch "expected=$FW_SIZE actual=$ACTUAL_SIZE"
+    return 1
+  fi
+
+  ACTUAL_SHA=$(sha256sum "$TMP_ZIP" | awk '{print $1}')
+  if [ "$ACTUAL_SHA" != "$FW_SHA" ]; then
+    rm -f "$TMP_ZIP"
+    fail_firmware_update checksum_mismatch "expected=$FW_SHA actual=$ACTUAL_SHA"
+    return 1
+  fi
+
+  if ! backup_current_firmware; then
+    rm -f "$TMP_ZIP"
+    return 1
+  fi
+
+  # state を書けないまま再起動すると fwrollback.sh が state を見つけられず、
+  # ロールバック監視が丸ごと無効になる。書けないなら更新を諦めるほうが安全。
+  if ! write_state "$FW_VERSION" "$FW_CURRENT" applied "$ROLLBACK_TIMEOUT" 0 ""; then
+    log_fw "firmware update aborted: cannot persist state to $STATE_FILE; refusing to reboot"
+    rm -f "$TMP_ZIP"
+    return 1
+  fi
+
+  mv "$TMP_ZIP" "$UPDATE_DIR/atomcam_tools.zip"
+  log_fw "firmware update staged: $FW_CURRENT -> $FW_VERSION, rebooting"
+  sync
+  reboot
+}
+
+# 旧ファームウェアをSDへ退避する。ロールバックはこの退避物だけが頼りなので、
+# コピー後に必ず内容を検証する。
+backup_current_firmware() {
+  if [ ! -f "$ROOTFS_IMAGE" ]; then
+    # ext2 rootfs で動作している個体などは squashfs が存在しない。
+    # 「バックアップ検証失敗」と区別できるログを出す
+    fail_firmware_update no_rootfs_image "$ROOTFS_IMAGE not found on this device"
+    return 1
+  fi
+
+  mkdir -p "$BACKUP_DIR"
+  rm -f "$BACKUP_DIR/factory_t31_ZMC6tiIDQN" "$BACKUP_DIR/rootfs_hack.squashfs"
+  cp "$KERNEL_IMAGE" "$BACKUP_DIR/factory_t31_ZMC6tiIDQN"
+  cp "$ROOTFS_IMAGE" "$BACKUP_DIR/rootfs_hack.squashfs"
+  if ! cmp -s "$KERNEL_IMAGE" "$BACKUP_DIR/factory_t31_ZMC6tiIDQN" \
+    || ! cmp -s "$ROOTFS_IMAGE" "$BACKUP_DIR/rootfs_hack.squashfs"; then
+    rm -f "$BACKUP_DIR/factory_t31_ZMC6tiIDQN" "$BACKUP_DIR/rootfs_hack.squashfs"
+    fail_firmware_update backup_failed "copy of the current firmware did not verify"
+    return 1
+  fi
+  return 0
+}
+
 run_daemon() {
   [ -f $MCONFIG ] || exit 0
   load_config
@@ -145,6 +368,7 @@ run_daemon() {
       camera_sync
       CONFIG_COUNTER=0
       UPLOAD_COUNTER=0
+      apply_firmware_update
     fi
 
     if [ "$IS_ENABLED" = "true" ]; then

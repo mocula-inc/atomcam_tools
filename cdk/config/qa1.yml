@@ -1,0 +1,2 @@
+# mocula-backend の cdk/config/qa1.yml の s3.imageBucketName と同じ値を指定する
+imageBucketName: "store.qa1.apne1.mocula-dev.com"

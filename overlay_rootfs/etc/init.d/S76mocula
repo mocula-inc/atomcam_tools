@@ -10,6 +10,20 @@ case "$1" in
     # iCamera_app が /tmp/resolv.conf を上書きするため、udhcpc に RENEW を送って DNS を復元する
     kill -USR1 $(pgrep udhcpc) > /dev/null 2>&1
     sleep 1
+
+    # 更新state(/media/mmc/fwupdate/state)が残っている間、起動ごとに BOOT_COUNT を+1する。
+    # PHASE の判定は行わない（フィルタは fwrollback.sh 側の責務）。
+    # ネットワーク断のまま再起動を繰り返したケースを fwrollback.sh が検知するためのフェイルセーフ。
+    # BOOT_COUNTED_FILE は /var/run(tmpfs)に置く。起動ごとに消えることが「1起動=1カウント」の前提。
+    # state の読み書きは fwstate.sh 経由で行う（値をシェルに解釈させず、書き込みは原子的にする）。
+    BOOT_COUNTED_FILE=/var/run/fwboot_counted
+    if [ ! -f "$BOOT_COUNTED_FILE" ]; then
+      . /scripts/fwstate.sh
+      if increment_state_boot_count; then
+        touch "$BOOT_COUNTED_FILE"
+      fi
+    fi
+
     /scripts/mocula.sh on &
     ;;
   stop)

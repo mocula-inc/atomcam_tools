@@ -25,3 +25,9 @@ lima:
 	[ "`uname -s`" = "Darwin" ] || exit 0
 	[ -d ~/.lima/lima-docker ] || ( limactl start --tty=false lima-docker.yml && exit 0 )
 	[ "`limactl list | awk '/lima-docker/ { print $2 }'`" = "Running" ] || limactl start lima-docker
+
+# ビルド済み atomcam_tools.zip (configs/mocula.ver のバージョン) を
+# mocula-backend の imageBucket の firmware/ota/{version}/ へ配置する
+# 使い方: make firmware-deploy CONFIG=dev1
+firmware-deploy:
+	cd cdk && npm install && npx cdk deploy --context config=$(CONFIG) --require-approval never

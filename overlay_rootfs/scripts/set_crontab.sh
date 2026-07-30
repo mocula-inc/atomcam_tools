@@ -12,6 +12,7 @@ BEGIN {
   printf("* * * * * /scripts/rtspserver.sh watchdog >> /media/mmc/atomhack.log\n");
   printf("* * * * * /atom_patch/system_bin/mount_cifs.sh watchdog >> /media/mmc/atomhack.log\n");
   printf("* * * * * /scripts/mocula.sh watchdog >> /media/mmc/atomhack.log\n");
+  printf("* * * * * /scripts/fwrollback.sh >> /media/mmc/atomhack.log\n");
   while((getline line < "/media/mmc/crontab") == 1) {
     print line;
   }
