@@ -31,17 +31,19 @@ INI 形式。SD カード上の `/media/mmc/mconfig` に配置する。
 tenantKey=<テナントキー>
 cameraKey=<カメラキー>
 origin=https://qa1.mocula-dev.com  # 省略時は https://app.mocula.jp
+clockSkewThreshold=60              # 省略時は 60（秒）。0 で時刻補正を無効化
 
 [firmware]
 rollbackTimeout=600  # 省略時は 600（秒）
 ```
 
-| キー              | セクション  | 説明                                                              |
-| ----------------- | ----------- | ----------------------------------------------------------------- |
-| `tenantKey`       | `global`    | テナント識別子                                                    |
-| `cameraKey`       | `global`    | カメラ識別子                                                      |
-| `origin`          | `global`    | API ベース URL（省略可。既定 `https://app.mocula.jp`）            |
-| `rollbackTimeout` | `firmware`  | 更新後にロールバックを発火させるまでの秒数（省略可。既定 `600`）  |
+| キー                  | セクション  | 説明                                                                    |
+| --------------------- | ----------- | ------------------------------------------------------------------------ |
+| `tenantKey`           | `global`    | テナント識別子                                                          |
+| `cameraKey`           | `global`    | カメラ識別子                                                            |
+| `origin`              | `global`    | API ベース URL（省略可。既定 `https://app.mocula.jp`）                  |
+| `clockSkewThreshold`  | `global`    | サーバ時刻とのズレがこれを超えたらカメラ時計を補正する秒数（省略可。既定 `60`。`0` で無効化） → [時刻同期](#時刻同期) |
+| `rollbackTimeout`     | `firmware`  | 更新後にロールバックを発火させるまでの秒数（省略可。既定 `600`）        |
 
 値の変更はデーモン起動時にしか読まれないため、`/etc/init.d/S76mocula restart` が必要。
 
@@ -65,7 +67,7 @@ rollbackTimeout=600  # 省略時は 600（秒）
 
 ```
 起動
- └─ mconfig 読み込み（tenantKey / cameraKey / origin / rollbackTimeout）
+ └─ mconfig 読み込み（tenantKey / cameraKey / origin / clockSkewThreshold / rollbackTimeout）
      └─ メインループ（1秒ごと）
           ├─ [60秒ごと] camera-sync API を呼び出し
           │    ├─ デバイス情報収集（SSID / RSSI / MAC / IP / タイムスタンプ）
@@ -73,14 +75,18 @@ rollbackTimeout=600  # 省略時は 600（秒）
           │    ├─ 更新state が failed / rolled_back / rollback_failed なら
           │    │  firmwareUpdateReport を添える
           │    ├─ POST /api/v1/camera-sync/{tenantKey}/{cameraKey}
-          │    └─ レスポンスから isEnabled / checkInterval / uploadUrls /
-          │       firmwareUpdate を取得
+          │    ├─ レスポンスから isEnabled / checkInterval / uploadUrls /
+          │    │  firstUploadDelay / serverEpoch / firmwareUpdate を取得
+          │    └─ serverEpoch とのズレが clockSkewThreshold を超えていれば
+          │       カメラ時計を補正（→ [時刻同期](#時刻同期)）
           │
           ├─ [60秒ごと、camera-sync の直後] ファームウェア適用判定
           │    └─ firmwareUpdate があれば apply_firmware_update
           │       （→ OTA セクション）
           │
-          └─ [isEnabled=true かつ checkInterval 秒ごと]
+          └─ [isEnabled=true かつ URL_QUEUE が空でない]
+               ├─ camera-sync 直後、firstUploadDelay 秒待ってから
+               │  1本目を消化。2本目以降は checkInterval 秒ごと
                ├─ uploadUrls キューから URL を 1 件取り出し
                ├─ JPEG キャプチャ（/scripts/cmd jpeg）
                ├─ tar アーカイブ作成（JPEG + contents.json）
@@ -89,6 +95,45 @@ rollbackTimeout=600  # 省略時は 600（秒）
 
 ファームウェアのダウンロードはこのループ内で同期的に行われるため、
 ダウンロード中（最大10分）は sync も画像アップロードも停止する。
+
+### アップロードタイミング
+
+次回撮影予定時刻はサーバがサーバ時計だけで管理しており、カメラはそれに依存しない
+「あと何秒で1本目を使うか」（`firstUploadDelay`）だけを受け取る。カメラ側は
+`UPLOAD_TIMER` という残り秒数のカウントダウンでこれを消化する。
+
+- `URL_QUEUE` が空のとき（起動直後、または前回分を消化しきったとき）だけ、
+  camera-sync のレスポンスで `UPLOAD_TIMER=$FIRST_UPLOAD_DELAY` に**再アンカー**し、
+  `URL_QUEUE` を新しいレスポンスの内容で置き換える
+- `URL_QUEUE` がまだ残っている場合は**上書きしない**。新しく配られた分は末尾に
+  追記するだけで、`UPLOAD_TIMER` のカウントダウンも触らない。camera-sync は
+  「次回撮影予定時刻」をサーバ側で前進させながら応答するため、期限がまだ来ていない
+  だけの正当な予約をここで上書きすると、二度と再配信されないまま消えてしまう
+- `UPLOAD_TIMER` はメインループの `sleep 1` と処理時間の分だけ実時間よりわずかに
+  遅れるが、次にキューが空になったタイミングでサーバ値により補正されるため
+  誤差は累積しない
+- `checkInterval <= 60` で1回の sync に複数本の URL が配られた場合、2本目以降は
+  `UPLOAD_TIMER=$CHECK_INTERVAL` で均等に消化する
+
+この方式に変える前は、`checkInterval` 秒ごとの判定をメインループのカウンタの剰余
+（`counter % checkInterval == 0`）で行っていた。このカウンタは camera-sync のたびに
+0 へリセットされるため、`checkInterval` が 60 の約数でない場合は
+「camera-sync 直後にしか URL を消化しない」実質的なバグになっており、
+送信間隔が設定値より最大1分近く短くなっていた。
+
+「空のときだけ置き換え、残っていれば追記」にしているのも同じ理由の再発防止策。
+単純に毎回上書きする実装では、`checkInterval` が sync 周期（60秒）の倍数のときに
+撮影期限と sync のタイミングがちょうど重なり、期限が来ていた撮影がキューの
+上書きで消える／サーバは既にその枠を配信済み扱いにしているため二度と来ない、
+という形で2回目以降のアップロードが永久に発生しなくなる不具合があった。
+
+`tests/test_mocula_timing.sh` が camera_sync / capture_and_upload をスタブ化し、
+実時間を消費せずに様々な `checkInterval`（60秒の約数・倍数を含む）でこの挙動を
+検証する（busybox ash、実機不要）。
+
+```sh
+busybox ash tests/test_mocula_timing.sh
+```
 
 ---
 
@@ -130,6 +175,8 @@ Content-Type: application/json
     "isEnabled": true,
     "checkInterval": 10,
     "uploadUrls": ["https://s3.amazonaws.com/..."],
+    "firstUploadDelay": 42,
+    "serverEpoch": 1785377113,
     "firmwareUpdate": {
       "version": "0.4.0",
       "url": "https://s3.amazonaws.com/...",
@@ -140,12 +187,14 @@ Content-Type: application/json
 }
 ```
 
-| フィールド       | 説明                                                                        |
-| ---------------- | --------------------------------------------------------------------------- |
-| `isEnabled`      | アップロード機能の有効/無効                                                 |
-| `checkInterval`  | アップロード間隔（秒）                                                      |
-| `uploadUrls`     | S3 pre-signed URL のリスト（有効期限 60 秒）                                |
-| `firmwareUpdate` | 更新指示。予約がある場合のみ。**予約が続く間は毎回同じ内容が返る**（後述）   |
+| フィールド         | 説明                                                                        |
+| ------------------ | --------------------------------------------------------------------------- |
+| `isEnabled`        | アップロード機能の有効/無効                                                 |
+| `checkInterval`    | アップロード間隔（秒）                                                      |
+| `uploadUrls`       | S3 pre-signed URL のリスト（有効期限 5 分）                                 |
+| `firstUploadDelay` | `uploadUrls` の1本目を使うまでの待機秒数。次回撮影予定時刻はサーバの時計だけで管理しており、カメラの時計に依存させないため絶対時刻ではなく相対秒で返す |
+| `serverEpoch`      | サーバ現在時刻（UNIX秒）。カメラ側の時刻補正に使う → [時刻同期](#時刻同期)  |
+| `firmwareUpdate`   | 更新指示。予約がある場合のみ。**予約が続く間は毎回同じ内容が返る**（後述）   |
 
 `firmwareUpdate` は 1 回きりの通知ではない。サーバはレスポンス消失に備えて予約が有効な間
 毎回同じオファーを返す（配信保証）ため、重複ダウンロードの防止はカメラ側の責務である
@@ -355,6 +404,8 @@ busybox ash tests/test_fwrollback.sh
 | `camera-sync failed: {レスポンス先頭200字}`        | `success:false` レスポンス（NOT_FOUND 等） |
 | `JPEG capture failed`                              | `/scripts/cmd jpeg` が空を返した           |
 | `upload failed: curl={N} HTTP={code} {レスポンス}` | S3 アップロード失敗                        |
+| `clock corrected: skew=...ms rtt=...ms -> ...`     | サーバ時刻との差が閾値超で時刻補正した（`atomhack.log` にも記録） |
+| `clock correction failed: date -s @...`            | `date -s` が失敗した                       |
 | `firmware download failed: curl error {N}`         | FW ダウンロードの通信エラー（再試行する）  |
 | `firmware update failed ({reason}): {詳細}`        | FW の検証・準備で失敗（停止して報告する）  |
 | `firmware update staged: {旧} -> {新}, rebooting`  | 適用して再起動する                        |
@@ -367,11 +418,36 @@ busybox ash tests/test_fwrollback.sh
 
 ## 既知の制限事項
 
-- **pre-signed URL の有効期限**: `uploadUrls` の有効期限は 60 秒。`checkInterval` や URL 数の組み合わせ次第では camera_sync 取得後のアップロードが期限切れになるリスクがある（TODO）。
+- **pre-signed URL の有効期限**: `uploadUrls` の有効期限は 5 分（`getPresignedUrlForUpload` の `60 * 5`）。`firstUploadDelay` による待機は地平線 90 秒以内に収まるよう設計されているため、有効期限に対して十分な余裕がある。
 - **更新中は sync と画像アップロードが止まる**: ダウンロードがメインループ内で同期的に行われるため、最大 10 分＋再起動 2 回のあいだ画像が上がらない。サーバ側は予約が有効なカメラの接続監視の猶予を延長して誤検知を防いでいる。
 - **バージョンを上げずに再ビルド・再デプロイしてはいけない**: S3 のオブジェクトだけが差し替わり、サーバに登録済みの size / checksum とずれるため、そのファームウェアを予約した全カメラが検証失敗する。再ビルドした場合はサーバ側の登録を削除してから登録し直すこと。
 - **A/B パーティションではない**: 退避は SD カード上の単一コピー。SD カードが壊れている場合はロールバックできない。
 - **署名検証はしていない**: 完全性は sha256 のみで担保している。
+
+---
+
+## 時刻同期
+
+カメラには常駐 ntpd（`/etc/init.d/S42ntpd`）が入っており、通常はこれで時刻が合う。
+起動時に `ntp.nict.jp` へ ping が通らない場合のみ `/media/mmc/time.ini` の古い時刻に
+フォールバックし、以後 NTP が塞がれた環境（企業 LAN で UDP 123 が塞がれている等）では
+ntpd が復旧できないまま時刻が狂い続けることがある。
+
+mocula.sh は camera-sync のたびに、サーバ現在時刻（`serverEpoch`）を使ってこれを
+救済する:
+
+1. camera-sync の curl 前後でカメラ時計の差分から RTT を求める
+2. 推定サーバ時刻 = `serverEpoch + RTT / 2`（往復の半分だけサーバのレスポンス生成時刻より
+   進んでいると仮定する）
+3. カメラ時計との差が `clockSkewThreshold`（既定 60 秒）を超えていれば `date -s` で補正し、
+   `/media/mmc/atomhack.log` に記録する
+
+**あくまで ntpd が機能しない場合のフォールバックであり、置き換えではない。** 閾値を
+小さくしすぎると常駐 ntpd との補正が競合するため、既定値を変える場合は注意すること。
+`clockSkewThreshold=0` で無効化できる。
+
+補正すると `capturedAt` が不連続になる（画像の撮影時刻が前後する）。原因調査の際は
+`/media/mmc/atomhack.log` の `clock corrected` ログを確認する。
 
 ---
 

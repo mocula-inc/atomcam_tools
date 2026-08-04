@@ -53,6 +53,20 @@ load_config() {
   TENANT_KEY="$global_tenantKey"
   CAMERA_KEY="$global_cameraKey"
   ROLLBACK_TIMEOUT="${firmware_rollbackTimeout:-600}"
+  # サーバ時刻によるカメラ時計のフォールバック補正の閾値(秒)。0 で無効化。
+  # 常駐 ntpd (S42ntpd) と綱引きにならないよう、既定は大きめにしてある。
+  # → mocula.md の「時刻同期」参照
+  CLOCK_SKEW_THRESHOLD="${global_clockSkewThreshold:-60}"
+}
+
+# カメラ時計での現在時刻(エポックミリ秒)。$((...)) はこの環境では32bit算術で
+# オーバーフローするため awk で計算する。
+current_epoch_ms() {
+  awk '
+    FNR==NR && $1=="btime" {b=$2; next}
+    FNR==1 {u=$1}
+    END {printf "%.0f\n", (b+u)*1000}
+  ' /proc/stat /proc/uptime
 }
 
 collect_device_info() {
@@ -61,11 +75,7 @@ collect_device_info() {
   WIFI_MAC=$(cat /sys/class/net/wlan0/address 2>/dev/null)
   IP_ADDR=$(ifconfig wlan0 2>/dev/null | grep 'inet addr' | awk '{print $2}' | cut -d: -f2)
   IP_MASK=$(ifconfig wlan0 2>/dev/null | grep 'inet addr' | awk '{print $4}' | cut -d: -f2)
-  TIMESTAMP=$(awk '
-    FNR==NR && $1=="btime" {b=$2; next}
-    FNR==1 {u=$1}
-    END {printf "%.0f\n", (b+u)*1000}
-  ' /proc/stat /proc/uptime)
+  TIMESTAMP=$(current_epoch_ms)
 }
 
 build_firmware_update_report() {
@@ -100,6 +110,31 @@ parse_firmware_update_offer() {
   fi
 }
 
+# サーバ時刻をフォールバックとしてカメラ時計を補正する。用途はあくまで常駐 ntpd
+# (S42ntpd) が機能しない環境（NTPポートが塞がれている等）の救済であり、通常運用では
+# CLOCK_SKEW_THRESHOLD 未満の差は無視して ntpd と競合しないようにする。
+# capturedAt が不連続になるため、補正した事実は必ずログに残す。
+sync_clock_from_server() {
+  [ -z "$SERVER_EPOCH" ] && return 0
+  [ "$CLOCK_SKEW_THRESHOLD" -le 0 ] && return 0
+
+  # curl の往復時間の半分だけ、サーバがレスポンスを生成した時刻より現在が進んでいると仮定する
+  ESTIMATED_SERVER_MS=$(awk "BEGIN{printf \"%.0f\", $SERVER_EPOCH*1000 + $RTT_MS/2}")
+  CAMERA_NOW_MS=$(current_epoch_ms)
+  SKEW_MS=$(awk "BEGIN{printf \"%.0f\", $ESTIMATED_SERVER_MS - $CAMERA_NOW_MS}")
+  SKEW_ABS_MS=$(awk "BEGIN{v=$SKEW_MS; if (v < 0) v = -v; printf \"%.0f\", v}")
+  THRESHOLD_MS=$((CLOCK_SKEW_THRESHOLD * 1000))
+
+  if [ "$SKEW_ABS_MS" -gt "$THRESHOLD_MS" ]; then
+    NEW_EPOCH_SEC=$(awk "BEGIN{printf \"%.0f\", $ESTIMATED_SERVER_MS/1000}")
+    if date -s "@$NEW_EPOCH_SEC" > /dev/null 2>&1; then
+      log_fw "clock corrected: skew=${SKEW_MS}ms rtt=${RTT_MS}ms -> set to server time (epoch=${NEW_EPOCH_SEC})"
+    else
+      log "clock correction failed: date -s @$NEW_EPOCH_SEC"
+    fi
+  fi
+}
+
 camera_sync() {
   collect_device_info
   FW_CURRENT=$(cat "$VERSION_FILE" 2>/dev/null)
@@ -107,27 +142,36 @@ camera_sync() {
   [ -n "$FW_CURRENT" ] && FW_VERSION_JSON=$(printf ',"firmwareVersion":"%s"' "$FW_CURRENT")
   build_firmware_update_report
 
+  SYNC_REQUEST_MS=$(current_epoch_ms)
   RESPONSE=$(curl --silent --max-time 30 \
     -X POST -H 'Content-Type: application/json' \
     -d "$(printf '{"wifi":{"ssid":"%s","rssi":%s,"mac":"%s"},"ip":{"address":"%s","netmask":"%s"},"timestamp":%s%s%s}' \
       "$WIFI_SSID" "${WIFI_RSSI:-0}" "$WIFI_MAC" "$IP_ADDR" "$IP_MASK" "$TIMESTAMP" "$FW_VERSION_JSON" "$REPORT_JSON")" \
     "${API_ORIGIN}/api/v1/camera-sync/${TENANT_KEY}/${CAMERA_KEY}")
   CURL_EXIT=$?
+  SYNC_RESPONSE_MS=$(current_epoch_ms)
+  # curl --max-time 30 があるため、RTT を補正しないと最大30秒の誤差になりうる。
+  # 差は小さい値だが、両オペランドはエポックミリ秒(32bit算術ではオーバーフローする桁数)
+  # なので他の時刻計算と同様に awk で引き算する。
+  RTT_MS=$(awk "BEGIN{printf \"%.0f\", $SYNC_RESPONSE_MS - $SYNC_REQUEST_MS}")
+  # sync 失敗時、まだ消化していない URL_QUEUE はそのまま残す(有効期限内の
+  # pre-signed URL であり、この sync が失敗したことと無関係に使える)。
+  # NEW_URL_QUEUE だけクリアして、直前の成功時の値を誤って合流させない。
   if [ $CURL_EXIT -ne 0 ]; then
     log "camera-sync failed: curl error $CURL_EXIT"
-    URL_QUEUE=""
+    NEW_URL_QUEUE=""
     FW_URL=""
     return 1
   fi
   if [ -z "$RESPONSE" ]; then
     log "camera-sync failed: empty response"
-    URL_QUEUE=""
+    NEW_URL_QUEUE=""
     FW_URL=""
     return 1
   fi
   if ! echo "$RESPONSE" | grep -q '"success":true'; then
     log "camera-sync failed: $RESPONSE"
-    URL_QUEUE=""
+    NEW_URL_QUEUE=""
     FW_URL=""
     return 1
   fi
@@ -136,6 +180,9 @@ camera_sync() {
   # 障害/ロールバック報告がサーバに届いたことが確認できたので、再試行ガードのstateを消す
   [ -n "$REPORT_JSON" ] && rm -rf "$STATE_DIR"
 
+  # 前回成功時の値が残らないよう、レスポンスに無ければ空になる項目は毎回リセットする
+  FIRST_UPLOAD_DELAY=""
+  SERVER_EPOCH=""
   eval $(echo "$RESPONSE" | awk '{
     gsub(/[{}]/, ""); gsub(/\[/, ""); gsub(/\]/, ""); gsub(/"/, "")
     n = split($0, pairs, ",")
@@ -145,10 +192,18 @@ camera_sync() {
       val = kv[m]
       if(key == "isEnabled") printf "IS_ENABLED=%s\n", val
       if(key == "checkInterval") printf "CHECK_INTERVAL=%s\n", val
+      if(key == "firstUploadDelay") printf "FIRST_UPLOAD_DELAY=%s\n", val
+      if(key == "serverEpoch") printf "SERVER_EPOCH=%s\n", val
     }
   }')
-  URL_QUEUE=$(echo "$RESPONSE" | sed 's/.*"uploadUrls":\[//; s/\].*//; s/"//g' | tr ',' '\n')
+  # firstUploadDelay を返さない旧サーバとの互換のため、未取得なら即時アップロード
+  # (従来の動作)にフォールバックする
+  FIRST_UPLOAD_DELAY="${FIRST_UPLOAD_DELAY:-0}"
+  # run_daemon 側で URL_QUEUE への合流方法(上書きか追記か)を判断するため、
+  # ここでは直接 URL_QUEUE を書き換えない
+  NEW_URL_QUEUE=$(echo "$RESPONSE" | sed 's/.*"uploadUrls":\[//; s/\].*//; s/"//g' | tr ',' '\n')
   parse_firmware_update_offer
+  sync_clock_from_server
 }
 
 next_upload_url() {
@@ -161,11 +216,7 @@ capture_and_upload() {
     return 1
   fi
 
-  MSEC=$(awk '
-    FNR==NR && $1=="btime" {b=$2; next}
-    FNR==1 {u=$1}
-    END {printf "%.0f\n", (b+u)*1000}
-  ' /proc/stat /proc/uptime)
+  MSEC=$(current_epoch_ms)
   # $((MSEC / 1000)) は 32bit 算術でオーバーフローするため awk で計算する
   SEC=$(awk "BEGIN{printf \"%d\", $MSEC/1000}")
   MS=$(awk "BEGIN{printf \"%d\", $MSEC%1000}")
@@ -359,7 +410,8 @@ run_daemon() {
   IS_ENABLED=false
   CHECK_INTERVAL=60
   CONFIG_COUNTER=0
-  UPLOAD_COUNTER=0
+  FIRST_UPLOAD_DELAY=0
+  UPLOAD_TIMER=0
   URL_QUEUE=""
 
   while true; do
@@ -367,22 +419,40 @@ run_daemon() {
     if [ $CONFIG_COUNTER -ge 60 ] || [ $CONFIG_COUNTER -eq 0 ]; then
       camera_sync
       CONFIG_COUNTER=0
-      UPLOAD_COUNTER=0
+      if [ -n "$URL_QUEUE" ]; then
+        # まだ消化しきっていない分が残っている場合は上書きせず末尾に追加するだけに
+        # する。ここで置き換えると、期限がまだ来ていないだけの正当な予約
+        # (サーバは既に next_capture_at を前進させて配信済み扱いにしている)が
+        # 失われ、二度と再配信されない。UPLOAD_TIMER のカウントダウンも触らない
+        # ことで、今まさに期限が来ている撮影が sync の割り込みで消えるのを防ぐ
+        # (checkInterval が sync 周期(60秒)の倍数のとき、期限と sync が同じ
+        # tick で重なることがあり、旧実装ではこれが原因で2回目以降のアップロード
+        # が永久に発生しなくなる不具合があった)。
+        [ -n "$NEW_URL_QUEUE" ] && URL_QUEUE="${URL_QUEUE}
+${NEW_URL_QUEUE}"
+      else
+        # サーバが返す firstUploadDelay で再アンカーする。次回撮影予定時刻は
+        # サーバの時計だけで管理しているため、このカウンタはカメラの時計に一切
+        # 依存しない。sleep 1 と処理時間の分だけ実時間より遅れるが、次に
+        # キューが空になったときに上書きされるため誤差は累積しない
+        # （→ mocula.md の「アップロードタイミング」参照）。
+        UPLOAD_TIMER=$FIRST_UPLOAD_DELAY
+        URL_QUEUE=$NEW_URL_QUEUE
+      fi
       apply_firmware_update
     fi
 
-    if [ "$IS_ENABLED" = "true" ]; then
-      # TODO: pre-signed URL の有効期限は 60 秒。CHECK_INTERVAL や URL 数の組み合わせ次第では
-      #       camera_sync 取得後のアップロードが期限切れになるリスクがある。
-      if [ $((UPLOAD_COUNTER % CHECK_INTERVAL)) -eq 0 ] && [ -n "$URL_QUEUE" ]; then
-        next_upload_url
-        capture_and_upload
-      fi
+    if [ "$IS_ENABLED" = "true" ] && [ -n "$URL_QUEUE" ] && [ "$UPLOAD_TIMER" -le 0 ]; then
+      next_upload_url
+      capture_and_upload
+      # checkInterval <= 60 の場合、1回の sync で複数本の URL が配られる。
+      # 2本目以降は checkInterval 秒ごとに均等に消化する。
+      UPLOAD_TIMER=$CHECK_INTERVAL
     fi
 
     sleep 1
     CONFIG_COUNTER=$((CONFIG_COUNTER + 1))
-    UPLOAD_COUNTER=$((UPLOAD_COUNTER + 1))
+    UPLOAD_TIMER=$((UPLOAD_TIMER - 1))
   done
 }
 
