@@ -167,7 +167,7 @@ make build
 | `timelapse.sh` | 62 | タイムラプス管理。開始: `cmd timelapse <file> <interval> <count> <fps>`。完了時: CIFS コピー、SD 保存、Webhook 通知。`timelapse_hook.sh` による拡張ポイントあり | cron, webhook.sh |
 | `hack_ini_reconfig.sh` | 187 | hack.ini のバージョン移行（1.0.0→1.0.1→1.0.2）。設定キー名変更、フォーマット変換、video_isp.conf の移行 | S17hackini |
 | `set_crontab.sh` | 34 | hack.ini から動的に crontab 生成。システムジョブ（ログローテーション 15分毎、クリーンアップ 1時間毎）+ REBOOT_SCHEDULE + TIMELAPSE_SCHEDULE | webcmd.sh |
-| `health_check.sh` | 63 | ネットワーク監視。ルーターへの ping → 失敗時 MONITORING_NETWORK=on ならネットワーク再起動、MONITORING_REBOOT=on なら 3 回失敗後にリブート。HEALTHCHECK_PING_URL への生存通知 | cron（毎分） |
+| `health_check.sh` | 537 | ネットワーク監視。sleep ループは持たず cron の毎分刻みだけで状態遷移する (実行は数秒で終わり多重起動しない)。起動後未接続なら最大 20 分辛抱強く待ってから復旧・リブート、一度接続した後の切断は 2〜6 分で早めに復旧。失敗原因を10種に分類し `/media/mmc/netdiag.log` に記録 (正常時は SD に一切書き込まない)。HEALTHCHECK_PING_URL への生存通知 | cron（毎分） |
 | `samba.sh` | 22 | Samba 制御（`on`/`off`）。STORAGE_SDCARD_PUBLISH=on で smbd/nmbd 起動。共有: record, time_lapse, alarm_record, update | S91smb, webcmd.sh |
 | `motor_init` | 40 | PTZ モーター初期化。`.user_config` から slide_x/slide_y 読み取り → horSwitch/verSwitch 考慮 → デフォルト位置に移動 | webhook.sh（モーターリセット時）, webcmd.sh |
 | `remove_old.sh` | 51 | 古い録画ファイルの自動削除。PERIODICREC/ALARMREC/TIMELAPSE ごとに SD カードと CIFS 個別に保持日数設定。`*._mp4`, `*.stsz` の 3 日超テンポラリも削除 | cron（1時間毎） |
