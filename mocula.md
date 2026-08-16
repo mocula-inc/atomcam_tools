@@ -429,9 +429,21 @@ busybox ash tests/test_fwrollback.sh
 ## 時刻同期
 
 カメラには常駐 ntpd（`/etc/init.d/S42ntpd`）が入っており、通常はこれで時刻が合う。
-起動時に `ntp.nict.jp` へ ping が通らない場合のみ `/media/mmc/time.ini` の古い時刻に
-フォールバックし、以後 NTP が塞がれた環境（企業 LAN で UDP 123 が塞がれている等）では
-ntpd が復旧できないまま時刻が狂い続けることがある。
+
+ただし S42ntpd が走る時点で疎通しているとは限らない。S41network は wpa_supplicant と
+udhcpc をバックグラウンドへ流したあと IP の取得を最大 10 秒しか待たずに戻るため、
+関連付けや DHCP がそれより遅ければアドレスすら無い。カメラがルーターより先に起動した
+場合は、IP があっても WAN が上がっていない。busybox 1.24 の ntpd は起動時の名前解決
+失敗が致命的（遅延再解決は 1.26 以降）なので、この状態で起動した常駐 ntpd は即死する。
+
+そのため S42ntpd は起動をブロックせず、バックグラウンドで 10 秒おきに `ntp.nict.jp` への
+疎通を確認し、繋がった時点で同期する。待つのは uptime 110 秒まで（health_check.sh の
+`BOOT_GRACE=120` の手前）で、それ以降の再試行は health_check.sh の `clock_recover()` へ
+一本化する（二重に再試行しない）。疎通を待つ前に、時計が 1970 のままで
+`/media/mmc/time.ini` があればそこへ寄せておく。
+
+NTP が塞がれた環境（企業 LAN で UDP 123 が塞がれている等）では、それでも ntpd が
+復旧できないまま時刻が狂い続けることがある。
 
 mocula.sh は camera-sync のたびに、サーバ現在時刻（`serverEpoch`）を使ってこれを
 救済する:
@@ -449,6 +461,71 @@ mocula.sh は camera-sync のたびに、サーバ現在時刻（`serverEpoch`�
 補正すると `capturedAt` が不連続になる（画像の撮影時刻が前後する）。原因調査の際は
 `/media/mmc/atomhack.log` の `clock corrected` ログを確認する。
 
+### health_check.sh との責務分担
+
+時計の面倒を見るのは 2 箇所あり、扱う壊れ方が違う。混同しないこと。
+
+| | 担当する壊れ方 | 検出 | 手段 |
+|---|---|---|---|
+| `health_check.sh` の `clock_recover()` | **大きく狂っている**（1970 のまま等） | `CLOCK_MIN_EPOCH`（ビルド時刻）の下限判定 | S42ntpd 再起動を最大 2 回 → 効かなければ平文 HTTP の `Date:` ヘッダで `date -s` |
+| `mocula.sh` の `sync_clock_from_server()` | **ドリフトした** | `clockSkewThreshold`（既定 60 秒） | camera-sync の `serverEpoch` |
+
+この分担が要る理由は鶏卵の向きにある。時計が 1970 のままだと `https://` の証明書が
+"not yet valid" になり `curl error 60` で camera-sync が**必ず**失敗するため、
+`sync_clock_from_server()` は永久に出番が来ない。health_check 側は camera-sync の
+成功を必要とせず平文 HTTP だけで完結するので、必ず先に走れる。
+
+health_check の補正後の残差は 60 秒を大きく下回るので `mocula.sh:128` の判定は
+false になり、両者が綱引きすることはない。
+
+`clock_recover()` は `INET_STATE` が `OK` か `ORIGIN_*` のときにしか呼ばれない
+（インターネットに出られない状態では ntpd も HTTP `Date:` も取れないため）。つまり
+**上流の開通を見逃している間は時計も直らない**。上流が遅れて上がってくるのは起動直後に
+集中するので、障害中の再確認間隔は起動後 `INET_EARLY_UNTIL`（600 秒）以内だけ
+`INET_FAIL_INTERVAL_EARLY`（30 秒）へ上げ、cron の刻みどおり毎分見直す。
+
+この 30 は「毎分」を意味する。cron の刻みは 60 秒ちょうどで `uptime_sec()` は `int()` で
+切り捨てるため、閾値を 60 にすると tick 間の差が 59 に落ちた回だけ黙ってスキップされ、
+実質 120 秒になる（ntpd の時刻ジャンプ直後は crond の発火間隔自体も乱れる）。
+**「毎 tick 実行したい」意図は 60 未満の閾値で表現すること。** 同じ理由で、
+`INET_FAIL_INTERVAL=120` と `INET_INTERVAL=600` も 60 の倍数ゆえ同じ性質を持つ。
+
+health_check は時計が検証済みになると `/media/mmc/time.ini` を `TIMEINI_INTERVAL`
+（1 時間）ごとに書く。`S42ntpd` はこれまで読むだけで誰も書いていなかった（死にコード
+だった）が、これにより次のブートではネットワークが上がる前に時計がほぼ正しくなり、
+NTP が恒久的に塞がれた環境でも `curl error 60` が再発しない。
+
+更新は `clock_recover()` の中で行う。同期が済んだ後もこの関数を素通りさせて
+`write_time_ini()` だけ呼び続ける構造になっており、**同期した瞬間の 1 回で終わらせない**
+のが要点（そうすると長期稼働したカメラの time.ini が起動時刻のまま古くなる）。
+`clock_recover()` は `INET_STATE` が `OK` か `ORIGIN_*` のときにしか呼ばれず、正常時の
+再確認は 600 秒間引きなので、実際の書き込みは 3600〜4200 秒に 1 回（1 日 20〜24 回、
+1 回あたり 20 バイト弱の tmp 作成 + rename）。長期の障害中は更新されないが、証明書の
+有効期間は通常数ヶ月あるので数時間から数日の陳腐化は問題にならない。
+
+**外から来た時刻は必ず `epoch_sane()` で上下限を確認してから使う。** 判定は
+`CLOCK_MIN_EPOCH`（そのビルドを作った時刻。それより前の時計はあり得ない）と
+`CLOCK_MAX_EPOCH`（2038/01/01）で、`clock_sane()` はこれに現在時刻を通しただけのものである。
+
+`CLOCK_MIN_EPOCH` はリリースのたびに更新する必要はなく、気づいたときにビルド時刻へ
+寄せれば十分だが、**上げたら `tests/test_health_check.sh` の「時計フィクスチャ」
+（`CLOCK_EPOCH` / `CLOCK_EPOCH_LATE` / `CLOCK_HTTP_DATE`）も同じだけ後ろへ動かすこと。**
+フィクスチャが下限を割ると `clock_sane()` が常に false になり、時刻系のテストが
+まとめて落ちる。片方だけ更新するのを防ぐため、両方の定数のすぐ上に相互参照の
+コメントを置いてある。
+
+下限だけを見ると壊れ方が非対称になる。`clock_from_http()` が読む `Date:` ヘッダは
+キャプティブポータルや改竄されたプロキシから来ることがあり、`Date: 2099` を通してしまうと
+そのまま `date -s` した挙句、この関数は**1 ブート 1 回**の制限で二度と走らない。
+`clock_sane()` は 2099 を弾くので `F_CLOCK_OK` は立つのに時計は狂ったまま、という
+最悪の組み合わせになり、ntpd が届かない環境では復旧手段が尽きる。同じ値が
+`write_time_ini()` 経由で time.ini に残ると、次のブートで `S42ntpd` がそれを復元する。
+そのため `clock_from_http()` と `write_time_ini()` の両方で確認している。
+
+なお範囲外だった場合も 1 ブート 1 回の制限は消費する（`F_CLOCK_HTTP` は関数の先頭で
+touch する）。時計はその後も 1970 のままだが、`clock=unsynced` としてサマリーに出るので
+検知はできる。
+
 ---
 
 ## 起動時の DNS 問題について
@@ -460,4 +537,72 @@ iCamera_app（カメラ純正ファームウェア）が起動時に `/tmp/resol
 kill -USR1 $(pgrep udhcpc) > /dev/null 2>&1
 sleep 1
 /scripts/mocula.sh on &
+```
+
+### これがワンショットであることと、そのバックストップ
+
+上記の RENEW は**ブートにつき 1 回だけ**なので、競合に負けると DNS が壊れたままになる:
+
+- その瞬間に wlan0 がまだ associate していない、あるいはルーターの DHCP が応答しない
+- iCamera_app による書き潰しが `S76mocula` の後に来る（chroot 内で非同期に起動するためタイミング次第）
+
+一度負けると、次に resolv.conf が書き直されるのは**DHCP リースの更新時**（家庭用ルーターなら
+12〜24 時間後）。この間ルーターへの ping は通るので旧 `health_check.sh` は正常と判定して
+何も記録せず、`camera_sync` は `curl error 6`（couldn't resolve host）を延々と繰り返し、
+その記録は tmpfs の `/tmp/log/mocula.log` にしか残らない（再起動で消える）。
+
+`health_check.sh` がこのバックストップになっている。名前解決だけが失敗している状態
+（`cause=DNS_FAILED`）を検出すると 5 分間隔で DHCP RENEW を打ち直し（1 エピソード 6 回まで）、
+`/media/mmc/healthcheck.log` に `resolv.conf` の中身ごと記録する。`S76mocula` 側の
+ワンショットは起動 1 秒後に一般的なケースを解決していて cron の初回（起動 2 分後）より
+遥かに速いため、そのまま残してある。
+
+**「名前解決だけが失敗している」の判定に 8.8.8.8 への ICMP を使っている。** curl の
+終了コード 6（couldn't resolve host）だけでは、resolv.conf のラッチと「ルーターの WAN が
+まだ上がっていない」（SIM ルーターの回線接続待ち等。DNS フォワーダに上流が無いので
+やはり 6 が返る）を区別できない。後者を `DNS_FAILED` と誤診すると、直るはずのない
+RENEW を 6 回打った挙句「name resolution failed」とログに残して次に調べる人を誤導する。
+ICMP は DNS を使わないので、`ICMP_OK` が両者を分ける（`inet_cause_from_curl()`）。
+代償として、ICMP が塞がれた環境では本物の DNS 障害が
+`INET_UNREACHABLE` と記録され、この RENEW が効かなくなる。
+
+**curl 28（timeout）だけは終了コードから内訳が読めないので、`nslookup` を一度だけ引いて
+振り分ける。** resolv.conf に「生きているが応答しないネームサーバ」が載っている状態
+（ラッチの一形態や、ルーター再起動中の DNS フォワーダ）では 6 ではなく 28 が返る。
+これを一律 `INET_HTTP_BLOCKED` にすると、復旧アクションもリブートも持たない終端状態に
+落ち、DHCP RENEW で解けるはずのラッチが永久に解けない。名前が引ければ従来どおり
+`INET_HTTP_BLOCKED`、引けなければ `DNS_FAILED` として RENEW の対象に入れる。
+
+**確認先は ICMP・HTTP とも事業者の異なる 2 系統を持つ**（`8.8.8.8` / `1.1.1.1`、
+`connectivitycheck.gstatic.com` / `cp.cloudflare.com`）。1 社に絞ると、その事業者が
+まとめて塞がれている網（Google が届かない国、企業のブロックリスト、ISP 側の障害）で
+正常なカメラを `INET_UNREACHABLE` と誤判定し、60 分ごとにリブートし続けることになる。
+予備を叩くのは 1 段目が失敗したときだけなので、正常時の所要時間と外部への負荷は
+変わらない。予備も 204 を返す実装を選んである（`captive.apple.com` や
+`msftconnecttest.com` は 200 + 本文なのでキャプティブポータルの判定式が壊れる）。
+時刻補正の `Date:` も、実際に 204 を返した方から取る。
+
+**origin のホスト名だけが引けない場合は `ORIGIN_DNS_FAILED` として切り離す。**
+origin 層を判定している時点で `connectivitycheck.gstatic.com` は 204 を返している
+＝システムの DNS は動いている証明があるので、そこで curl 6 が返るのは
+「そのホスト名だけが引けない」（typo、NXDOMAIN、社内 DNS 限定のドメイン）を意味する。
+これを `DNS_FAILED` と呼ぶとインターネット層の状態に混ざり、直るはずのない DHCP RENEW を
+6 回打った上で 60 分後にリブートしてしまう。`ORIGIN_*` は復旧アクションの対象外なので、
+接頭辞を保つだけで両方が閉じる（`origin_cause_from_curl()`）。
+
+```
+2026/08/11 03:14:02 : up=130s cause=DNS_FAILED : name resolution failed (curl=6) : resolv.conf=[<empty>] probe=connectivitycheck.gstatic.com
+2026/08/11 03:19:11 : up=439s DHCP renew (SIGUSR1) : iface=wlan0 pid=1122
+2026/08/11 03:21:02 : up=550s internet recovered : cause=DNS_FAILED lasted=420s (dhcp_renew×1) : resolv.conf=[nameserver 192.168.1.1]
+```
+
+復帰のログは `internet recovered` と `origin recovered` に分かれる。`ORIGIN_*` は
+generate_204 が通っていた＝**インターネットは最初から生きていて origin だけが落ちて
+いた**状態なので、これを `internet recovered` と書くとログだけを見た人が回線やルーターを
+疑うことになる。末尾に添える情報も切り分けに効くものへ変えてある（DNS 系なら
+`resolv.conf`、TLS 系なら `clock`）。
+
+```
+2026/08/12 15:41:02 : up=120s cause=ORIGIN_TLS_FAILED origin=qa1.mocula-dev.com:443 : curl=60 clock=1970/01/01 09:02:01 (clock suspect)
+2026/08/12 15:43:02 : up=253s origin recovered : cause=ORIGIN_TLS_FAILED lasted=133s : clock=2026/08/12 15:43:02
 ```

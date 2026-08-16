@@ -2,22 +2,104 @@
 #
 # Start network time daemon
 #
+# 時計が 1970 のままだと https の証明書検証が "not yet valid" で全滅する
+# (curl exit 60 = health_check.sh の ORIGIN_TLS_FAILED)。
+#
+# ところがこのスクリプトが動く時点で疎通しているとは限らない。S41network は
+# wpa_supplicant と udhcpc をバックグラウンドへ流したあと IP の取得を最大 10 秒しか
+# 待たずに戻る (network_init.sh の while ループ) ため、関連付けや DHCP がそれより
+# 遅ければアドレスすら無い。カメラがルーターより先に起動した場合は、IP があっても
+# WAN がまだ上がっていない。
+#
+# 旧実装はここで一度だけ ping して、失敗したら諦めて常駐 ntpd を起動していた。
+# busybox 1.24 の ntpd は起動時の名前解決失敗が致命的 (遅延再解決は 1.26 以降) なので
+# その常駐 ntpd も即死し、結果として時計は health_check.sh が拾う BOOT_GRACE=120 秒後
+# まで 1970 のまま放置されていた (実機では復旧が起動後 253 秒)。
+#
+# そこで起動をブロックせずにバックグラウンドで疎通を待ち、繋がった時点で同期する。
+# 待ち受けは health_check.sh が引き取る 120 秒の手前で打ち切り、以降の再試行は
+# health_check.sh の clock_recover() に一本化する (二重に再試行しない)。
+#
+
+NTP_SERVER=ntp.nict.jp
+NTP_WAIT_INTERVAL=10        # 疎通確認の間隔
+NTP_BOOT_DEADLINE=110       # この uptime を過ぎたら待つのをやめる (BOOT_GRACE=120 の手前)
+# ★ この値は 4 箇所で揃えること。1 つでも忘れると時計まわりが黙って壊れる:
+#      scripts/health_check.sh   の CLOCK_MIN_EPOCH   (定数ブロック)
+#      tests/test_s42ntpd.sh     の CLOCK_EPOCH       (時計フィクスチャ)
+#      tests/test_health_check.sh の CLOCK_EPOCH      (時計フィクスチャ)
+#    テスト側のフィクスチャがこの値より前だと、時刻系のテストが落ちるか誤って通る。
+CLOCK_MIN_EPOCH=1786712722  # 2026-08-14 22:05:22 JST (=13:05:22 UTC)。これより前 = 未同期
+TIMEINI=/media/mmc/time.ini
+LOOPPID=/tmp/ntpd_boot.pid  # 疎通待ちループの多重起動防止
+LOG=/tmp/log/ntpd.log       # health_check.sh の ntpd_restart() と同じ出力先
+
+uptime_sec() {
+  awk '{print int($1); exit}' /proc/uptime 2>/dev/null
+}
+
+clock_sane() {
+  _e=$(date +%s 2>/dev/null)
+  case "$_e" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_e" -ge $CLOCK_MIN_EPOCH ]
+}
+
+# ネットワークを待たずに、SD に残した検証済みの時刻でおおよそ合わせておく。
+# 正確ではないが 1970 よりは遥かにマシで、証明書の有効期間は通常数ヶ月あるため
+# これだけで TLS が通ることが多い。正しい時刻は後続の ntpd が上書きする。
+restore_time_ini() {
+  clock_sane && return 1              # 既にまともなら古い time.ini で狂わせない
+  [ -f $TIMEINI ] || return 1
+  _t=$(sed -ne 's/utc=//p' $TIMEINI 2>/dev/null)
+  case "$_t" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_t" -lt $CLOCK_MIN_EPOCH ] && return 1
+  date -s @$_t > /dev/null 2>&1
+}
+
+# ping が通る = 経路も名前解決も生きている = busybox ntpd が使える状態。
+sync_once() {
+  ping -c 1 -W 3 $NTP_SERVER > /dev/null 2>&1 || return 1
+  /usr/sbin/ntpd -qn -p $NTP_SERVER
+}
+
+# 疎通するまで待ってから同期し、最後に常駐 ntpd を起動する。
+# 疎通しないまま期限が来た場合も常駐 ntpd の起動までは旧実装と同じ動きをする
+# (どのみち health_check.sh が生死を見て再起動を掛ける)。
+boot_sync() {
+  while : ; do
+    sync_once && break
+    _u=$(uptime_sec)
+    [ -z "$_u" ] && _u=$NTP_BOOT_DEADLINE   # uptime が読めないなら粘らない
+    [ "$_u" -ge $NTP_BOOT_DEADLINE ] && break
+    sleep $NTP_WAIT_INTERVAL
+  done
+  /usr/sbin/ntpd -p $NTP_SERVER
+  rm -f $LOOPPID
+}
 
 case "$1" in
   start)
     logger -s "Starting ntpd: "
-    if ping -c 1 ntp.nict.jp > /dev/null ; then
-      /usr/sbin/ntpd -qn -p ntp.nict.jp
-    else
-      [ -f /media/mmc/time.ini ] && date -s @`sed -ne 's/utc=//p' /media/mmc/time.ini`
+    mkdir -p /tmp/log
+    restore_time_ini && \
+      logger -s "ntpd: clock preset from $TIMEINI -> `date +'%Y/%m/%d %H:%M:%S'`"
+    if [ -f $LOOPPID ] && kill -0 "`cat $LOOPPID`" 2> /dev/null ; then
+      logger -s "ntpd: boot sync already pending"
+      exit 0
     fi
-    /usr/sbin/ntpd -p ntp.nict.jp
-    [ $? == 0 ] && logger -s "OK" || logger -s "FAIL"
+    boot_sync >> $LOG 2>&1 &
+    echo $! > $LOOPPID
+    logger -s "OK"
   ;;
   stop)
     logger -s "Stopping ntpd: "
+    # 疎通待ちループを先に止める。残すと stop した後に ntpd を勝手に立ち上げる。
+    if [ -f $LOOPPID ] ; then
+      kill "`cat $LOOPPID`" 2> /dev/null
+      rm -f $LOOPPID
+    fi
     killall ntpd
-    [ $? == 0 ] && logger -s "OK" || logger -s "FAIL"
+    [ $? = 0 ] && logger -s "OK" || logger -s "FAIL"
   ;;
   restart|reload)
     "$0" stop
