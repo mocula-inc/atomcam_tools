@@ -140,7 +140,7 @@ make build
 | `S21rootkeys` | 26 | `/media/mmc/authorized_keys` → `/root/.ssh/authorized_keys` コピー | S20mountfs |
 | `S40hostname` | 26 | ホスト名設定。`/media/mmc/hostname` を `/etc/hostname` に bind mount | S20mountfs |
 | `S41network` | 22 | `network_init.sh` に委譲。WiFi モジュール検出・ドライバーロード・wpa_supplicant 起動・DHCP 取得 | S40hostname |
-| `S42ntpd` | 32 | NTP 同期（ntp.nict.jp）。失敗時は `/media/mmc/time.ini` のタイムスタンプを使用 | S41network |
+| `S42ntpd` | 105 | NTP 同期（ntp.nict.jp）。起動時点では疎通していないことがあるため、起動をブロックせずバックグラウンドで 10 秒おきに疎通を待って同期する（uptime 110 秒で打ち切り、以降は `health_check.sh` の `clock_recover()` が引き取る）。待つ前に `/media/mmc/time.ini` で時計を寄せる | S41network |
 | `S43timezone.env` | 34 | `/media/mmc/TZ` からタイムゾーン設定。`.user_config` に UTC オフセット書き込み | S42ntpd |
 | `S53crond` | 35 | cron デーモン起動（ログレベル 8） | S43timezone |
 | `S55sshd` | 50 | SSH サーバー起動。ホスト鍵がなければ自動生成。`authorized_keys` 必須 | S21rootkeys |
@@ -167,7 +167,7 @@ make build
 | `timelapse.sh` | 62 | タイムラプス管理。開始: `cmd timelapse <file> <interval> <count> <fps>`。完了時: CIFS コピー、SD 保存、Webhook 通知。`timelapse_hook.sh` による拡張ポイントあり | cron, webhook.sh |
 | `hack_ini_reconfig.sh` | 187 | hack.ini のバージョン移行（1.0.0→1.0.1→1.0.2）。設定キー名変更、フォーマット変換、video_isp.conf の移行 | S17hackini |
 | `set_crontab.sh` | 34 | hack.ini から動的に crontab 生成。システムジョブ（ログローテーション 15分毎、クリーンアップ 1時間毎）+ REBOOT_SCHEDULE + TIMELAPSE_SCHEDULE | webcmd.sh |
-| `health_check.sh` | 537 | ネットワーク監視。sleep ループは持たず cron の毎分刻みだけで状態遷移する (実行は数秒で終わり多重起動しない)。起動後未接続なら最大 20 分辛抱強く待ってから復旧・リブート、一度接続した後の切断は 2〜6 分で早めに復旧。失敗原因を10種に分類し `/media/mmc/netdiag.log` に記録 (正常時は SD に一切書き込まない)。HEALTHCHECK_PING_URL への生存通知 | cron（毎分） |
+| `health_check.sh` | 1248 | ネットワーク監視。sleep ループは持たず cron の毎分刻みだけで状態遷移する (実行は数秒で終わり多重起動しない)。**wifi → ゲートウェイ → インターネット → origin → 時計**の5層で判定し、失敗原因を18種に分類して `/media/mmc/healthcheck.log` と `netdiag.log` に記録。起動後未接続なら最大 20 分辛抱強く待ってから復旧・リブート、一度接続した後の切断は 2〜6 分で早めに復旧。ゲートウェイまで通っているのにインターネットへ出られない状態は DHCP RENEW で DNS ラッチを解き (WAN 断との区別に ICMP を使い、curl 28 は nslookup で名前解決の可否を確かめてから振り分ける)、確認先は ICMP・HTTP とも事業者の異なる 2 系統を持ち片方が塞がれた網での誤判定を避け、60 分継続でリブート (SD 録画も LAN 経由の操作も持たないため回数の打ち止めは設けず、繋がるまで約 62 分周期で繰り返す)。origin だけが失敗した場合は `ORIGIN_*` に隔離し、インターネット層の判定や DHCP RENEW・リブートには波及させない。障害中の再確認は 120 秒間隔だが、上流が遅れて上がってくる起動後 600 秒以内は 30 秒間隔 = cron の毎分刻みへ上げる。インターネット到達後に時計が狂っていれば S42ntpd 再起動 → HTTP Date の順で補正。正常時の SD 書き込みはブート毎のサマリー (ゲートウェイ断から復帰したブートのみ暫定+確定の2行、通常は1行) と、`time.ini` の1時間ごとの更新のみ。HEALTHCHECK_PING_URL への生存通知 | cron（毎分） |
 | `samba.sh` | 22 | Samba 制御（`on`/`off`）。STORAGE_SDCARD_PUBLISH=on で smbd/nmbd 起動。共有: record, time_lapse, alarm_record, update | S91smb, webcmd.sh |
 | `motor_init` | 40 | PTZ モーター初期化。`.user_config` から slide_x/slide_y 読み取り → horSwitch/verSwitch 考慮 → デフォルト位置に移動 | webhook.sh（モーターリセット時）, webcmd.sh |
 | `remove_old.sh` | 51 | 古い録画ファイルの自動削除。PERIODICREC/ALARMREC/TIMELAPSE ごとに SD カードと CIFS 個別に保持日数設定。`*._mp4`, `*.stsz` の 3 日超テンポラリも削除 | cron（1時間毎） |
