@@ -250,7 +250,9 @@ report_session_ended() {
   esac
 }
 
-# OFFER_FILE の offer を go2rtc に渡して answer を得て backend に提出する
+# OFFER_FILE の offer を go2rtc に渡して answer を得て backend に提出する。
+# 戻り値: 0=P2P確立、2=P2P不可を backend へ報告済み(呼び出し元は静止画配信へ倒す)、
+#         1=それ以外の失敗(backend は何も知らないためセッションを畳んで終了する)
 handle_offer() {
   local session_id="$1"
   local http_code
@@ -259,7 +261,7 @@ handle_offer() {
   if ! stack_start; then
     log "handle_offer: stack_start failed, reporting busy"
     report_answer_error "$session_id" busy
-    return 1
+    return 2
   fi
 
   # go2rtc が ICE candidates を収集し終えるまでブロック(non-trickle)。
@@ -276,7 +278,7 @@ handle_offer() {
     log "handle_offer: go2rtc exchange failed http=$http_code"
     report_answer_error "$session_id" stack_failed
     stack_stop
-    return 1
+    return 2
   fi
 
   # answer を backend に提出(TODO 確認待ちのエンドポイント、上記参照)
@@ -293,7 +295,10 @@ handle_offer() {
       return 0
       ;;
     *)
-      # answer がバックエンドに届いていないため streaming にはせず、スタックを畳んで失敗を返す
+      # answer がバックエンドに届いていないため streaming にはせず、スタックを畳んで失敗を返す。
+      # busy/stack_failed と違い backend へ「P2P不可」を伝えられていない (セッションは
+      # SENT_TO_CAMERA のまま) ので、静止画配信へは倒さず 1 を返す。backend への POST 自体が
+      # 失敗している状況であり、静止画の POST も同様に失敗する公算が高い。
       log "handle_offer: answer delivery failed http=$http_code"
       stack_stop
       return 1
@@ -421,6 +426,7 @@ run_session() {
   local idle_sec=0
   local session_sec=0
   local consumers=0
+  local handle_offer_rc
 
   log "session start id=$session_id"
   log_debug "config: origin=$API_ORIGIN tenant=$TENANT_KEY camera=$CAMERA_KEY sessionPoll=$LIVE_SESSION_POLL"
@@ -433,8 +439,21 @@ run_session() {
     return 1
   fi
 
-  if ! handle_offer "$session_id"; then
-    return 1
+  handle_offer "$session_id"
+  handle_offer_rc=$?
+  [ $handle_offer_rc -eq 1 ] && return 1
+
+  # P2P が張れず backend へ busy/stack_failed を報告済みのケース。backend はこの報告で
+  # セッションを IMAGE_FALLBACK に遷移させ、ブラウザにも「静止画へ切り替えよ」と応答する。
+  # ここで終了すると送り手が居なくなり、視聴者は GET /frame が 503 のまま何も表示されない
+  # (実機で確認済み)。JPEG 取得は /scripts/cmd 経由で go2rtc/v4l2rtspserver とは独立して
+  # いるため、P2P スタックが起動できなくても静止画配信は継続できる。
+  if [ $handle_offer_rc -eq 2 ]; then
+    log "session: P2P unavailable, falling back to image mode"
+    image_mode "$session_id" 0
+    stack_stop
+    log "session end id=$session_id"
+    return 0
   fi
 
   # セッション中ループ: state/consumers を報告し stop/image を処理する
