@@ -159,6 +159,48 @@ parse_firmware_update_offer() {
   fi
 }
 
+# デジタルズーム(取得範囲指定)。captureRegion は firmwareUpdate と同様レスポンスに無ければ
+# 省略されるフィールドなので、CAPTURE_* は毎回リセットしてから解析する(前回値の持ち越しを防ぐ)。
+# 高さは 16:9 から height = width * 9 / 16 で一意に導出するため持たない(→ mocula.md 参照)。
+# サーバ側が権威だが、値は後段で ffmpeg のコマンドラインへ直接入るため、ここでも独立に
+# 範囲検証する(多重防御)。x/y は sed のパターン([0-9]、符号なし)により非負であることが
+# 構文上保証されるため、負値チェックは不要。
+parse_capture_region() {
+  CAPTURE_X=""
+  CAPTURE_Y=""
+  CAPTURE_W=""
+  CAPTURE_H=""
+  CR_JSON=$(echo "$RESPONSE" | sed -n 's/.*"captureRegion":{\([^}]*\)}.*/\1/p')
+  [ -z "$CR_JSON" ] && return 0
+
+  X=$(echo "$CR_JSON" | sed -n 's/.*"x":\([0-9]\{1,4\}\).*/\1/p')
+  Y=$(echo "$CR_JSON" | sed -n 's/.*"y":\([0-9]\{1,4\}\).*/\1/p')
+  W=$(echo "$CR_JSON" | sed -n 's/.*"width":\([0-9]\{1,4\}\).*/\1/p')
+  if [ -z "$X" ] || [ -z "$Y" ] || [ -z "$W" ]; then
+    log "capture_region: missing field in captureRegion, ignoring"
+    return 0
+  fi
+
+  if [ "$W" -lt 640 ] || [ "$W" -gt 1920 ] || [ $((W % 16)) -ne 0 ]; then
+    log "capture_region: invalid width $W, ignoring"
+    return 0
+  fi
+  if [ $((X + W)) -gt 1920 ]; then
+    log "capture_region: x=$X width=$W exceeds frame width, ignoring"
+    return 0
+  fi
+  H=$((W * 9 / 16))
+  if [ $((Y + H)) -gt 1080 ]; then
+    log "capture_region: y=$Y height=$H exceeds frame height, ignoring"
+    return 0
+  fi
+
+  CAPTURE_X=$X
+  CAPTURE_Y=$Y
+  CAPTURE_W=$W
+  CAPTURE_H=$H
+}
+
 # サーバ時刻をフォールバックとしてカメラ時計を補正する。用途はあくまで常駐 ntpd
 # (S42ntpd) が機能しない環境（NTPポートが塞がれている等）の救済であり、通常運用では
 # CLOCK_SKEW_THRESHOLD 未満の差は無視して ntpd と競合しないようにする。
@@ -261,6 +303,7 @@ camera_sync() {
   NEW_URL_QUEUE=$(echo "$RESPONSE" | sed 's/.*"uploadUrls":\[//; s/\].*//; s/"//g' | tr ',' '\n')
   log_debug "camera_sync: isEnabled=$IS_ENABLED checkInterval=$CHECK_INTERVAL urlCount=$(echo "$NEW_URL_QUEUE" | grep -c .)"
   parse_firmware_update_offer
+  parse_capture_region
   sync_clock_from_server
 
   # liveAction/liveSessionId/uptimeStart/uptimeEnd は脆い汎用パーサ(eval)を通さず専用抽出する。
@@ -282,6 +325,41 @@ next_upload_url() {
   URL_QUEUE=$(echo "$URL_QUEUE" | tail -n +2)
 }
 
+JPEG_QUALITY=5  # ffmpeg -q:v。5 で ch1 ネイティブ相当(-q:v 8)よりやや大きい約38KB
+
+# $1 = 出力先パス。呼び出し元(capture_and_upload)が $TMPDIR(tmpfs)配下のパスを渡す前提。
+# CAPTURE_W が空(=ズーム未設定)なら従来通り ch1 をそのまま使う。
+# ズーム設定時は ch0(1920x1080)を取得し、指定範囲を切り出して 640x360 に縮小する。
+# その際、OSD タイムスタンプは範囲によって半端に写り込むため撮影の瞬間だけ消す
+# (→ mocula.md の「タイムスタンプ(OSD)の扱い」参照)。osdSwitch はチャンネル共通の
+# グローバル設定なので、off にする窓は「ch0 を取得するまで」に絞り、ffmpeg の
+# crop/scale(数百ms)はこの窓に含めない。
+capture_jpeg() {
+  if [ -z "$CAPTURE_W" ]; then
+    /scripts/cmd jpeg 1 | sed '1,3d' > "$1"  # ch1: サブストリーム 640x360(タイムスタンプ付き)
+    return
+  fi
+
+  if ! /scripts/cmd property timestamp off | grep -q '^ok'; then
+    log "capture_region: failed to disable timestamp OSD, falling back to ch1"
+    /scripts/cmd jpeg 1 | sed '1,3d' > "$1"
+    return
+  fi
+  RAW="$1.raw"  # $1 は $TMPDIR(tmpfs)配下 → "$1.raw" も自動的に同じ tmpfs 上に置かれる
+  /scripts/cmd jpeg 0 | sed '1,3d' > "$RAW"  # ch0: メインストリーム 1920x1080
+  /scripts/cmd property timestamp on  # 取得直後に即座に戻す(共有設定の露出窓を最短化)
+
+  if [ -s "$RAW" ] && ffmpeg -y -nostdin -loglevel error -threads 1 -i "$RAW" \
+       -vf "crop=$CAPTURE_W:$CAPTURE_H:$CAPTURE_X:$CAPTURE_Y,scale=640:360" \
+       -q:v $JPEG_QUALITY "$1" 2>>$LOGFILE && [ -s "$1" ]; then
+    rm -f "$RAW"
+    return
+  fi
+  log "capture_region: ffmpeg failed (${CAPTURE_W}x${CAPTURE_H}+${CAPTURE_X}+${CAPTURE_Y}), falling back to ch1"
+  rm -f "$RAW"
+  /scripts/cmd jpeg 1 | sed '1,3d' > "$1"  # この1枚はタイムスタンプ付き(on に戻した後のため)
+}
+
 capture_and_upload() {
   if [ -z "$UPLOAD_URL" ]; then
     return 1
@@ -295,7 +373,7 @@ capture_and_upload() {
   ISO_TIME="$(TZ=UTC date -d @$SEC +"%Y-%m-%dT%H:%M:%S")$(printf ".%03dZ" $MS)"
 
   TMPDIR=$(mktemp -d)
-  /scripts/cmd jpeg 1 | sed '1,3d' > "$TMPDIR/${MSEC}.jpg"  # ch1: サブストリーム 640x360
+  capture_jpeg "$TMPDIR/${MSEC}.jpg"
   if [ ! -s "$TMPDIR/${MSEC}.jpg" ]; then
     log "JPEG capture failed"
     rm -rf "$TMPDIR"
@@ -508,6 +586,10 @@ run_daemon() {
   UPTIME_END=""
   SYNC_FAIL_COUNT=0
   LAST_LIVE_SESSION=""
+  CAPTURE_X=""
+  CAPTURE_Y=""
+  CAPTURE_W=""
+  CAPTURE_H=""
 
   while true; do
     # Sync with server every 60 seconds

@@ -182,7 +182,8 @@ Content-Type: application/json
       "url": "https://s3.amazonaws.com/...",
       "size": 47963166,
       "checksum": "628870d2..."
-    }
+    },
+    "captureRegion": { "x": 320, "y": 180, "width": 1280 }
   }
 }
 ```
@@ -195,6 +196,7 @@ Content-Type: application/json
 | `firstUploadDelay` | `uploadUrls` の1本目を使うまでの待機秒数。次回撮影予定時刻はサーバの時計だけで管理しており、カメラの時計に依存させないため絶対時刻ではなく相対秒で返す |
 | `serverEpoch`      | サーバ現在時刻（UNIX秒）。カメラ側の時刻補正に使う → [時刻同期](#時刻同期)  |
 | `firmwareUpdate`   | 更新指示。予約がある場合のみ。**予約が続く間は毎回同じ内容が返る**（後述）   |
+| `captureRegion`    | デジタルズーム（取得範囲指定）。設定がある場合のみ返す（後述）              |
 
 `firmwareUpdate` は 1 回きりの通知ではない。サーバはレスポンス消失に備えて予約が有効な間
 毎回同じオファーを返す（配信保証）ため、重複ダウンロードの防止はカメラ側の責務である
@@ -202,6 +204,38 @@ Content-Type: application/json
 
 `firmwareUpdate.url` の有効期限は 15 分。ダウンロードの `curl --max-time` は 600 秒なので、
 どちらかを変更する場合は他方も併せて見直すこと。
+
+### デジタルズーム（取得範囲指定）
+
+被写体が小さく写る設置環境向けに、1920x1080 のメインストリーム（ch0）から指定範囲を切り出し、
+640x360 に縮小してアップロードする機能。`captureRegion` が未設定のカメラは従来通り
+640x360 のサブストリーム（ch1）をそのまま送る。
+
+`captureRegion` の座標系は常にメインストリーム(1920x1080)基準。`x`/`y` は左上原点、
+`width` は 640〜1920 の 16 の倍数。高さは持たず `height = width * 9 / 16` で一意に導出する
+（ch0/ch1 とも 16:9 で正確に 3 倍の関係にあるため）。
+
+**撮影経路**（`overlay_rootfs/scripts/mocula.sh` の `capture_jpeg()`）:
+
+1. `captureRegion` が無ければ従来通り `cmd jpeg 1` のみ
+2. あれば `cmd property timestamp off` → `cmd jpeg 0` → `cmd property timestamp on` →
+   `ffmpeg` で `crop=width:height:x:y,scale=640:360` → 640x360 の JPEG
+3. 途中のいずれかが失敗した場合（`property timestamp off` が `ok` を返さない／
+   ffmpeg が失敗する等）は ch1 の直接キャプチャにフォールバックする。ログには必ず残す
+   （フォールバック発生時、その回はズーム前の画角のままアップロードされることになる）
+
+**タイムスタンプ（OSD）を消す理由**: 標準のキャプチャ画像は右下に日時が焼き込まれる
+（IMP の OSD 機能）が、この焼き込み位置は各チャンネルの解像度に比例した絶対座標であり、
+ズーム範囲によっては文字が半端に入り込んだり歪んで残ったりする。そこで
+`cmd property timestamp off`/`on`（`libcallback/property.c` の `osdSwitch`）で撮影の
+瞬間だけ OSD 自体を消す。**この設定は ch0/ch1 で共有されるグローバル設定**なので、
+off にしている短い窓（実測 0.13 秒程度）とライブ視聴中の `mocula_live.sh` の
+`cmd jpeg 1` 呼び出しが重なると、そのライブフレーム 1 枚だけタイムスタンプが欠ける
+可能性がある。窓が短くライブ視聴中に限られるため実害は小さいと見て許容している。
+
+`ffmpeg` の `drawtext` フィルタで日時を書き直す案も検討したが、実機のビルドには
+`drawtext` フィルタ自体が含まれていない（フォント合成に必要な `libharfbuzz` が無い）ため
+採用しなかった。
 
 ### S3 アップロード
 
