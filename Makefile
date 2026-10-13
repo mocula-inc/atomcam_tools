@@ -34,7 +34,7 @@ lima:
 #       一致していること（両者の一致は検証していないので手動で確認する）。
 #       同じバージョンで再デプロイすると S3 の実体だけが差し替わり、登録済みの
 #       size/sha256 とずれて全カメラが検証失敗するため、必ずバージョンを上げる。
-# 環境変数: MOCULA_ADMIN_EMAIL / MOCULA_ADMIN_PASSWORD が必要
+# 環境変数: MOCULA_FIRMWARE_API_KEY、または MOCULA_ADMIN_EMAIL / MOCULA_ADMIN_PASSWORD が必要
 #           (MOCULA_ADMIN_PASSWORD 未設定なら対話的に入力を求める)
 # 使い方: make firmware-deploy CONFIG=dev1
 firmware-deploy: firmware-upload firmware-register
