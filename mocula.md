@@ -383,14 +383,14 @@ echo "0.4.0" > configs/mocula.ver      # 唯一のバージョン定義元。必
 make build
 
 export MOCULA_ADMIN_EMAIL=you@mocula.co.jp
-make firmware-deploy CONFIG=dev1      # dev1 | qa1 | prod1 | prod2
+make firmware-deploy CONFIG=dev1      # dev1 | qa1 | qa2 | prod1 | prod2
 ```
 
 `firmware-deploy` は次の2段を順に実行する。S3 に置くだけではカメラへ配信できない。
 
 | ターゲット          | 内容                                                                |
 | ------------------- | ------------------------------------------------------------------- |
-| `firmware-upload`   | CDK で `firmware/ota/{version}/atomcam_tools.zip` へ配置             |
+| `firmware-upload`   | `firmware/ota/{version}/atomcam_tools.zip` へ配置                    |
 | `firmware-register` | `POST /api/v1/admin/firmwares` で登録（size と sha256 はサーバが算出） |
 
 配置先バケットと API のURLは `cdk/config/{stage}.yml` の `imageBucketName` / `apiOrigin`
@@ -402,6 +402,28 @@ make firmware-deploy CONFIG=dev1      # dev1 | qa1 | prod1 | prod2
 登録だけをやり直したい場合は `make firmware-register CONFIG=dev1`。
 配置済みのバージョンを再登録すると 409 になるので、その場合は先に
 `DELETE /api/v1/admin/firmwares/{id}` で登録を削除する。
+
+#### GitHub Actions による配置・登録（qa1 / qa2）
+
+main にファームウェアへ入るファイルの変更が入ると、`.github/workflows/deploy.yml` が qa1 と qa2 へ
+配置・登録する。ドキュメントなど、ファームウェアに入らないファイルだけの変更では動かない。
+手動実行（Actions → Deploy → Run workflow）では、登録先とブランチ・タグ・コミットハッシュを選べる。
+
+- 基準は `configs/mocula.ver` だけ。そのバージョンが登録済みの環境には何もしない。
+  どの環境にも登録済みならビルドもしない。
+- ビルドした zip は `s3://storage.mocula-devs.com/atomcam_tools/atomcam_tools_{version}_{commit}.zip`
+  に保管し、qa1 と qa2 には同じものを配る。同じバージョンの zip が別のコミットから保管済みなら、
+  バージョンの上げ忘れとして失敗する。同じコミットの zip があるのは実行のやり直しなので、それを使う。
+- 登録は手元と同じ `POST /api/v1/admin/firmwares` を、管理者ログインの代わりに API キー
+  （`X-Api-Key` ヘッダ、環境変数 `MOCULA_FIRMWARE_API_KEY`）で呼ぶ。
+  キーは mocula-backend の `scripts/put-secrets.sh <stage> firmware-deploy-api-key` で登録し、
+  同じ値を GitHub Environment（`qa1` / `qa2`）のシークレットに入れる。
+- プルリクエストでは `buildscripts/check_firmware_version.sh` が、ファームウェアに入るファイルの
+  変更と `configs/mocula.ver` の更新が揃っているかを確かめる。片方だけの変更はマージできない。
+
+登録先を増やすときは、`cdk/config/<name>.yml` を足し、ワークフローの `options` と `matrix`、
+`check` ジョブの `outputs` に環境名を足す。あわせて同名の GitHub Environment を作り、
+IAM ロール `github-atomcam-tools-deploy` の信頼ポリシーと S3 の許可に追加する。
 
 登録後、カメラごとに予約すると配信が始まる。
 

@@ -1,0 +1,240 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+    # ファームウェアに入るファイルが変わったときだけ動かす
+    # （buildscripts/check_firmware_version.sh の FIRMWARE_PATHS と揃えること）
+    paths:
+      - docker-compose.yml
+      - buildscripts/**
+      - configs/**
+      - custompackages/**
+      - initramfs_skeleton/**
+      - libcallback/**
+      - overlay_rootfs/**
+      - patches/**
+      - web/**
+      - "!buildscripts/check_firmware_version.sh"
+      - "!buildscripts/register_firmware.sh"
+      - "!buildscripts/upload_firmware.sh"
+      - "!libcallback/**/*.md"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 登録先（cdk/config/<name>.yml）
+        type: choice
+        required: true
+        options:
+          - qa1
+          - qa2
+      ref:
+        description: ビルドするブランチ・タグ・コミットハッシュ（このワークフローを含むものに限る）
+        type: string
+        required: true
+        default: main
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-1
+  # ビルドした zip の保管先。同じバージョンのものがあればここから取り出し、ビルドし直さない
+  FIRMWARE_STORE: s3://storage.mocula-devs.com/atomcam_tools
+
+jobs:
+  # configs/mocula.ver のバージョンが登録済みの環境には何もしない。
+  # どの環境にも登録済みならビルドもしない
+  check:
+    name: Check ${{ matrix.environment }}
+    # fork では AWS のロールを引き受けられないので動かさない
+    if: github.repository == 'mocula-inc/atomcam_tools'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('["{0}"]', inputs.environment) || '["qa1","qa2"]') }}
+    environment: ${{ matrix.environment }}
+    outputs:
+      commit: ${{ steps.target.outputs.commit }}
+      version: ${{ steps.target.outputs.version }}
+      # matrix の各ジョブが自分の環境の分だけを埋める
+      qa1: ${{ steps.status.outputs.qa1 }}
+      qa2: ${{ steps.status.outputs.qa2 }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # 短縮ハッシュやタグも解決できるように全履歴を取る
+          fetch-depth: 0
+      - name: Checkout target ref
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TARGET_REF: ${{ inputs.ref }}
+        run: |
+          COMMIT=$(git rev-parse --verify --quiet "origin/${TARGET_REF}^{commit}" || git rev-parse --verify "${TARGET_REF}^{commit}")
+          git checkout --detach "$COMMIT"
+      - name: Resolve target
+        id: target
+        run: |
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=$(tr -d ' \t\r\n' < configs/mocula.ver)" >> "$GITHUB_OUTPUT"
+      - name: Check registration
+        id: status
+        env:
+          STAGE: ${{ matrix.environment }}
+          VERSION: ${{ steps.target.outputs.version }}
+          MOCULA_FIRMWARE_API_KEY: ${{ secrets.MOCULA_FIRMWARE_API_KEY }}
+        run: |
+          STATUS=$(./buildscripts/register_firmware.sh "$STAGE" --check)
+          echo "$STAGE=$STATUS" >> "$GITHUB_OUTPUT"
+          if [ "$STATUS" = "registered" ]; then
+            echo "::notice::$STAGE: $VERSION は登録済みのため何もしません"
+          fi
+
+  build:
+    name: Build firmware
+    needs: check
+    # どの環境にも登録済みでも、保管済みの zip との照合（Resolve object）は毎回行う。
+    # 片方の環境の確認が失敗しても、確認できた環境には登録する
+    if: ${{ !cancelled() && needs.check.outputs.commit != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      NEEDED: ${{ contains(toJSON(needs.check.outputs), 'unregistered') }}
+    outputs:
+      object: ${{ steps.object.outputs.uri }}
+      needed: ${{ env.NEEDED }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.check.outputs.commit }}
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      # このワークフローはファームウェアの中身が変わったときに動くので、同じバージョンの zip が
+      # 別のコミットから保管済みなら、バージョンの上げ忘れとして失敗させる。
+      # 同じコミットの zip があるのは実行のやり直しなので、ビルドし直さずそれを使う
+      - name: Resolve object
+        id: object
+        env:
+          COMMIT: ${{ needs.check.outputs.commit }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          BUCKET=${FIRMWARE_STORE#s3://}
+          PREFIX=${BUCKET#*/}/atomcam_tools_${VERSION}_
+          BUCKET=${BUCKET%%/*}
+          # 一覧の取得に失敗したら「まだ無い」とは読まず、ジョブを失敗させる
+          # shellcheck disable=SC2016
+          KEYS=$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$PREFIX" \
+            --query 'sort_by(Contents || `[]`, &LastModified)[].Key' --output text | tr '\t' '\n')
+          # 前方一致では 1.2.3 が 1.2.3_rc の分まで拾うので、名前全体で確かめる
+          EXISTING=$(printf '%s\n' "$KEYS" | grep -E -x -m 1 "${PREFIX//./\\.}[0-9a-f]{7}\.zip" || true)
+          if [ -n "$EXISTING" ]; then
+            if [ "$EXISTING" != "${PREFIX}${COMMIT:0:7}.zip" ]; then
+              echo "::error::$VERSION は別のコミットから s3://$BUCKET/$EXISTING としてビルド済みです。configs/mocula.ver を上げてください"
+              exit 1
+            fi
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "uri=s3://$BUCKET/$EXISTING" >> "$GITHUB_OUTPUT"
+            echo "::notice::保管済みの s3://$BUCKET/$EXISTING を使います"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "uri=s3://$BUCKET/${PREFIX}${COMMIT:0:7}.zip" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Free disk space
+        if: env.NEEDED == 'true' && steps.object.outputs.found == 'false'
+        # ビルド用イメージは展開すると約 14GB あり、そのままではランナーの空きに収まらない
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Build firmware
+        if: env.NEEDED == 'true' && steps.object.outputs.found == 'false'
+        # make build は tee で終了コードを捨てるため、ビルドスクリプトを直接呼ぶ
+        run: |
+          docker compose up -d
+          docker compose exec -T builder /src/buildscripts/build_all < /dev/null
+      - name: Verify firmware
+        if: env.NEEDED == 'true' && steps.object.outputs.found == 'false'
+        run: |
+          unzip -l atomcam_tools.zip
+          for file in factory_t31_ZMC6tiIDQN rootfs_hack.squashfs; do
+            unzip -l atomcam_tools.zip "$file" > /dev/null
+          done
+          sha256sum atomcam_tools.zip
+      # ビルドが長引くと最初に引き受けた認証情報の期限が切れるため、取り直す
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        if: env.NEEDED == 'true' && steps.object.outputs.found == 'false'
+        with:
+          role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Store firmware
+        if: env.NEEDED == 'true' && steps.object.outputs.found == 'false'
+        env:
+          OBJECT: ${{ steps.object.outputs.uri }}
+        run: aws s3 cp atomcam_tools.zip "$OBJECT" --only-show-errors
+
+  deploy:
+    name: Deploy ${{ matrix.environment }}
+    needs: [check, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.build.outputs.needed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('["{0}"]', inputs.environment) || '["qa1","qa2"]') }}
+    environment: ${{ matrix.environment }}
+    concurrency:
+      group: deploy-${{ matrix.environment }}
+      cancel-in-progress: false
+    env:
+      STAGE: ${{ matrix.environment }}
+      COMMIT: ${{ needs.check.outputs.commit }}
+      VERSION: ${{ needs.check.outputs.version }}
+      OBJECT: ${{ needs.build.outputs.object }}
+      MOCULA_FIRMWARE_API_KEY: ${{ secrets.MOCULA_FIRMWARE_API_KEY }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.check.outputs.commit }}
+      # 先行する実行が同じバージョンを登録し終えていることがあるため、順番が回ってきてから確かめ直す
+      - name: Check registration
+        id: status
+        run: |
+          STATUS=$(./buildscripts/register_firmware.sh "$STAGE" --check)
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          if [ "$STATUS" = "registered" ]; then
+            echo "::notice::$STAGE: $VERSION は登録済みのため何もしません"
+            echo "$STAGE: $VERSION は登録済みのため何もしていません" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        if: steps.status.outputs.status == 'unregistered'
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Fetch firmware
+        if: steps.status.outputs.status == 'unregistered'
+        run: aws s3 cp "$OBJECT" atomcam_tools.zip --only-show-errors
+      - name: Upload firmware
+        if: steps.status.outputs.status == 'unregistered'
+        env:
+          # 未登録と確かめた直後なので、登録に失敗した前回の実行が残したオブジェクトは置き換えてよい
+          FIRMWARE_FORCE: "1"
+        run: ./buildscripts/upload_firmware.sh "$STAGE"
+      - name: Register firmware
+        if: steps.status.outputs.status == 'unregistered'
+        env:
+          FIRMWARE_NOTE: GitHub Actions (${{ needs.check.outputs.commit }})
+        run: |
+          ./buildscripts/register_firmware.sh "$STAGE"
+          {
+            echo "$STAGE: $VERSION を登録しました"
+            echo
+            echo "- commit: \`$COMMIT\`"
+            echo "- sha256: \`$(sha256sum atomcam_tools.zip | awk '{print $1}')\`"
+            echo "- build: \`$OBJECT\`"
+          } >> "$GITHUB_STEP_SUMMARY"

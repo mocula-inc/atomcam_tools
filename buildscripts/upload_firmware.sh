@@ -16,7 +16,7 @@ set -euo pipefail
 
 STAGE=${1:-}
 if [ -z "$STAGE" ]; then
-  echo "usage: $0 <stage>   (dev1 | qa1 | prod1 | prod2)" >&2
+  echo "usage: $0 <stage>   (dev1 | qa1 | qa2 | prod1 | prod2)" >&2
   exit 1
 fi
 
