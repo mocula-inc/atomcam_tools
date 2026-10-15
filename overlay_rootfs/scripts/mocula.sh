@@ -7,6 +7,17 @@ MCONFIG=/media/mmc/mconfig
 # /var/run は tmpfs。起動ごとに消えることが前提で、fwrollback.sh は「更新後の起動で一度でも
 # camera-sync に成功したか」の判定にこのファイルを使う。永続領域へ移してはならない。
 SYNC_OK_FILE=/var/run/mocula.sync_ok
+# 直近の camera-sync が isEnabled=false を返している間だけ存在する。発行済みのバッチ
+# (run_upload_batch)は別プロセスで動いているため、一時停止をこのファイル経由で伝える。
+PAUSED_FILE=/var/run/mocula.paused
+# camera-sync の周期(秒)。サーバ側の発行地平線(90秒)はこの周期を前提にしている。
+SYNC_INTERVAL=60
+# 同時に走らせる撮影〜アップロードの上限(全バッチ合計)。回線が詰まって curl(最大30秒)が
+# 積み上がったときに、メモリの少ない実機を巻き込まないための歯止め。
+MAX_PARALLEL_UPLOADS=4
+# 実行中の撮影〜アップロードを、PID を名前にした空ファイルで記録する。バッチは sync ごとに
+# 別プロセスなので、変数では他のバッチのぶんを数えられない。
+UPLOAD_PID_DIR=/var/run/mocula.uploads
 VERSION_FILE=/etc/mocula.ver
 UPDATE_DIR=/media/mmc/update
 BACKUP_DIR=/media/mmc/fwbackup
@@ -115,6 +126,13 @@ current_epoch_ms() {
     FNR==1 {u=$1}
     END {printf "%.0f\n", (b+u)*1000}
   ' /proc/stat /proc/uptime
+}
+
+# 起動からの経過秒(小数2桁)を MONO_NOW に入れる。間隔の計測はすべてこれで行う。
+# カメラの壁時計は ntpd や sync_clock_from_server で飛ぶため、間隔の基準には使えない。
+# メインループから毎秒呼ぶので、fork しないよう read で読む。
+read_monotonic() {
+  read MONO_NOW _ < /proc/uptime
 }
 
 collect_device_info() {
@@ -237,21 +255,25 @@ camera_sync() {
   LIVE_SESSION=""
   log_debug "camera_sync: POST ${API_ORIGIN}/api/v1/camera-sync/${TENANT_KEY}/${CAMERA_KEY}"
   SYNC_REQUEST_MS=$(current_epoch_ms)
+  read_monotonic
+  SYNC_SENT_MONO=$MONO_NOW
   RESPONSE=$(curl --silent --max-time 30 \
     -X POST -H 'Content-Type: application/json' \
     -d "$(printf '{"wifi":{"ssid":"%s","rssi":%s,"mac":"%s"},"ip":{"address":"%s","netmask":"%s"},"timestamp":%s%s%s}' \
       "$WIFI_SSID" "${WIFI_RSSI:-0}" "$WIFI_MAC" "$IP_ADDR" "$IP_MASK" "$TIMESTAMP" "$FW_VERSION_JSON" "$REPORT_JSON")" \
     "${API_ORIGIN}/api/v1/camera-sync/${TENANT_KEY}/${CAMERA_KEY}")
   CURL_EXIT=$?
+  read_monotonic
+  SYNC_RECEIVED_MONO=$MONO_NOW
   SYNC_RESPONSE_MS=$(current_epoch_ms)
   # curl --max-time 30 があるため、RTT を補正しないと最大30秒の誤差になりうる。
   # 差は小さい値だが、両オペランドはエポックミリ秒(32bit算術ではオーバーフローする桁数)
   # なので他の時刻計算と同様に awk で引き算する。
   RTT_MS=$(awk "BEGIN{printf \"%.0f\", $SYNC_RESPONSE_MS - $SYNC_REQUEST_MS}")
   log_debug "camera_sync: curl_exit=$CURL_EXIT response_len=${#RESPONSE}"
-  # sync 失敗時、まだ消化していない URL_QUEUE はそのまま残す(有効期限内の
+  # sync 失敗時も、発行済みのバッチは別プロセスでそのまま消化を続ける(有効期限内の
   # pre-signed URL であり、この sync が失敗したことと無関係に使える)。
-  # NEW_URL_QUEUE だけクリアして、直前の成功時の値を誤って合流させない。
+  # NEW_URL_QUEUE をクリアして、直前の成功時の URL でバッチを二重に起動させない。
   if [ $CURL_EXIT -ne 0 ]; then
     log "camera-sync failed: curl error $CURL_EXIT"
     camera_sync_save_error "curl_error" "exit_code=$CURL_EXIT"
@@ -298,8 +320,7 @@ camera_sync() {
   # firstUploadDelay を返さない旧サーバとの互換のため、未取得なら即時アップロード
   # (従来の動作)にフォールバックする
   FIRST_UPLOAD_DELAY="${FIRST_UPLOAD_DELAY:-0}"
-  # run_daemon 側で URL_QUEUE への合流方法(上書きか追記か)を判断するため、
-  # ここでは直接 URL_QUEUE を書き換えない
+  # この sync で配られた URL 一式。run_daemon が1つのバッチとして run_upload_batch に渡す
   NEW_URL_QUEUE=$(echo "$RESPONSE" | sed 's/.*"uploadUrls":\[//; s/\].*//; s/"//g' | tr ',' '\n')
   log_debug "camera_sync: isEnabled=$IS_ENABLED checkInterval=$CHECK_INTERVAL urlCount=$(echo "$NEW_URL_QUEUE" | grep -c .)"
   parse_firmware_update_offer
@@ -320,9 +341,92 @@ camera_sync() {
   log_debug "camera_sync: liveAction=$LIVE_ACTION liveSessionId=$LIVE_SESSION uptimeStart=$UPTIME_START uptimeEnd=$UPTIME_END"
 }
 
-next_upload_url() {
-  UPLOAD_URL=$(echo "$URL_QUEUE" | head -1)
-  URL_QUEUE=$(echo "$URL_QUEUE" | tail -n +2)
+# いま撮影してよいかを判定する。バッチは発行から最大で地平線(90秒)ぶん生き続けるため、
+# その間に変わりうる条件は、撮影の直前に毎回確かめる。
+upload_allowed() {
+  if [ -f "$PAUSED_FILE" ]; then
+    log_debug "upload skipped: paused"
+    return 1
+  fi
+  # UPTIME_START と UPTIME_END の両方が設定されている場合、現在時刻(HHMMSS)がその範囲内にあるときのみアップロードする
+  # (uptimeStart/uptimeEnd は API のフィールド名。システム稼働時間ではなく時刻(時分秒)を表す)
+  if [ -n "$UPTIME_START" ] && [ -n "$UPTIME_END" ]; then
+    NOW_HMS_NUM=$(expr $(date +"%H%M%S") + 0)
+    if [ $NOW_HMS_NUM -lt $(expr $UPTIME_START + 0) ] || [ $NOW_HMS_NUM -gt $(expr $UPTIME_END + 0) ]; then
+      log_debug "upload skipped: outside uptime window"
+      return 1
+    fi
+  fi
+  RUNNING=0
+  for PID in $(ls "$UPLOAD_PID_DIR" 2> /dev/null); do
+    if kill -0 "$PID" 2> /dev/null; then
+      RUNNING=$((RUNNING + 1))
+    else
+      # kill された等で自分の記録を消せずに終わったぶん。残すと上限を食い潰す
+      rm -f "$UPLOAD_PID_DIR/$PID"
+    fi
+  done
+  if [ $RUNNING -ge $MAX_PARALLEL_UPLOADS ]; then
+    log "upload skipped: $RUNNING uploads still in flight"
+    return 1
+  fi
+  return 0
+}
+
+# 撮影〜アップロード1回ぶんをバックグラウンドで走らせる。ここで待たないことで、ffmpeg や
+# アップロードに時間が掛かっても次の撮影時刻が後ろへずれない。
+spawn_upload() {
+  (
+    capture_and_upload
+    # サブシェル自身の PID。$$ は親(バッチ)の PID を返すので使えない
+    read SELF_PID _ < /proc/self/stat
+    rm -f "$UPLOAD_PID_DIR/$SELF_PID"
+  ) &
+  : > "$UPLOAD_PID_DIR/$!"
+}
+
+# 1回の camera-sync で配られた URL 一式(バッチ)を、サーバが決めた時刻どおりに消化する。
+# i 本目の撮影時刻は「sync した時刻 + firstUploadDelay + i * checkInterval」。毎回この式で
+# 求め直し、前の撮影が終わった時刻を起点にしないので、処理時間が間隔に上乗せされない。
+# サーバは次回撮影予定時刻を連続して管理しているため、バッチ同士は隙間も重複もなく繋がる
+# (→ mocula.md の「アップロードタイミング」参照)。
+run_upload_batch() {
+  case "$CHECK_INTERVAL" in
+    '' | *[!0-9]*) log "upload batch: invalid checkInterval [$CHECK_INTERVAL]"; return 1 ;;
+  esac
+  case "$FIRST_UPLOAD_DELAY" in
+    '' | *[!0-9]*) log "upload batch: invalid firstUploadDelay [$FIRST_UPLOAD_DELAY]"; return 1 ;;
+  esac
+  [ "$CHECK_INTERVAL" -gt 0 ] || return 1
+
+  # pre-signed URL は ? を含む。下の for で単語分割するときにパス名展開させない
+  set -f
+  mkdir -p "$UPLOAD_PID_DIR"
+  SLOT=0
+  for UPLOAD_URL in $NEW_URL_QUEUE; do
+    read_monotonic
+    # サーバが firstUploadDelay を計算した瞬間は、リクエスト送信と応答受信の中間とみなす。
+    # 経過秒は整数に収まらない(小数)ので awk で計算する。
+    WAIT=$(awk "BEGIN{
+      w = ($SYNC_SENT_MONO + $SYNC_RECEIVED_MONO) / 2 + $FIRST_UPLOAD_DELAY + $SLOT * $CHECK_INTERVAL - $MONO_NOW
+      if (w < -$CHECK_INTERVAL) print \"late\"; else if (w > 0) printf \"%.2f\", w; else print 0
+    }")
+    SLOT=$((SLOT + 1))
+    # 1周期以上遅れた枠は捨てる。連写して取り戻すと、同じ時刻の画像が並ぶだけになる。
+    if [ "$WAIT" = "late" ]; then
+      log "upload skipped: slot $SLOT is more than ${CHECK_INTERVAL}s late"
+      continue
+    fi
+    [ "$WAIT" != "0" ] && sleep "$WAIT"
+    upload_allowed || continue
+    log_debug "upload batch: triggering upload (slot=$SLOT check_interval=$CHECK_INTERVAL)"
+    spawn_upload
+  done
+}
+
+# テストではバッチを同期実行に差し替えるため、バックグラウンド起動だけを関数に分けてある
+spawn_upload_batch() {
+  (run_upload_batch) &
 }
 
 JPEG_QUALITY=5  # ffmpeg -q:v。5 で ch1 ネイティブ相当(-q:v 8)よりやや大きい約38KB
@@ -578,10 +682,8 @@ run_daemon() {
 
   IS_ENABLED=false
   CHECK_INTERVAL=60
-  CONFIG_COUNTER=0
   FIRST_UPLOAD_DELAY=0
-  UPLOAD_TIMER=0
-  URL_QUEUE=""
+  NEW_URL_QUEUE=""
   UPTIME_START=""
   UPTIME_END=""
   SYNC_FAIL_COUNT=0
@@ -590,12 +692,26 @@ run_daemon() {
   CAPTURE_Y=""
   CAPTURE_W=""
   CAPTURE_H=""
+  rm -f "$PAUSED_FILE"
+  rm -rf "$UPLOAD_PID_DIR"
 
+  read_monotonic
+  NEXT_SYNC_AT=${MONO_NOW%%.*}
   while true; do
-    # Sync with server every 60 seconds
-    if [ $CONFIG_COUNTER -ge 60 ] || [ $CONFIG_COUNTER -eq 0 ]; then
-      log_debug "loop: triggering camera_sync (config_counter=$CONFIG_COUNTER)"
+    read_monotonic
+    # sync の時刻は「前回の予定時刻 + SYNC_INTERVAL」で決める。ループの回数で数えると、
+    # sync 自体の所要時間ぶんだけ周期が延びていく。
+    if [ "${MONO_NOW%%.*}" -ge "$NEXT_SYNC_AT" ]; then
+      log_debug "loop: triggering camera_sync (uptime=$MONO_NOW)"
       camera_sync
+      # 撮影はバッチに任せ、メインループは待たない。1本目の撮影時刻を遅らせないよう、
+      # sync の後処理(ライブ開始・ファーム更新)より先に起動する。
+      if [ "$IS_ENABLED" = "true" ]; then
+        rm -f "$PAUSED_FILE"
+        [ -n "$NEW_URL_QUEUE" ] && spawn_upload_batch
+      else
+        touch "$PAUSED_FILE"
+      fi
       # ライブ開始トリガ: liveAction=offer かつ 未処理の新しい liveSessionId のときだけ
       # mocula_live.sh をオンデマンド起動する。同一 id での再 spawn を防ぐ多重防御。
       if [ "$LIVE_ACTION" = "offer" ] && [ -n "$LIVE_SESSION" ] && [ "$LIVE_SESSION" != "$LAST_LIVE_SESSION" ]; then
@@ -603,55 +719,15 @@ run_daemon() {
         log "live start trigger session=$LIVE_SESSION"
         (call_mocula_live start "$LIVE_SESSION") &
       fi
-      CONFIG_COUNTER=0
-      if [ -n "$URL_QUEUE" ]; then
-        # まだ消化しきっていない分が残っている場合は上書きせず末尾に追加するだけに
-        # する。ここで置き換えると、期限がまだ来ていないだけの正当な予約
-        # (サーバは既に next_capture_at を前進させて配信済み扱いにしている)が
-        # 失われ、二度と再配信されない。UPLOAD_TIMER のカウントダウンも触らない
-        # ことで、今まさに期限が来ている撮影が sync の割り込みで消えるのを防ぐ
-        # (checkInterval が sync 周期(60秒)の倍数のとき、期限と sync が同じ
-        # tick で重なることがあり、旧実装ではこれが原因で2回目以降のアップロード
-        # が永久に発生しなくなる不具合があった)。
-        [ -n "$NEW_URL_QUEUE" ] && URL_QUEUE="${URL_QUEUE}
-${NEW_URL_QUEUE}"
-      else
-        # サーバが返す firstUploadDelay で再アンカーする。次回撮影予定時刻は
-        # サーバの時計だけで管理しているため、このカウンタはカメラの時計に一切
-        # 依存しない。sleep 1 と処理時間の分だけ実時間より遅れるが、次に
-        # キューが空になったときに上書きされるため誤差は累積しない
-        # （→ mocula.md の「アップロードタイミング」参照）。
-        UPLOAD_TIMER=$FIRST_UPLOAD_DELAY
-        URL_QUEUE=$NEW_URL_QUEUE
-      fi
       apply_firmware_update
-    fi
-
-    if [ "$IS_ENABLED" = "true" ]; then
-      # UPTIME_START と UPTIME_END の両方が設定されている場合、現在時刻(HHMMSS)がその範囲内にあるときのみアップロードする
-      # (uptimeStart/uptimeEnd は API のフィールド名。システム稼働時間ではなく時刻(時分秒)を表す)
-      if [ -n "$UPTIME_START" ] && [ -n "$UPTIME_END" ]; then
-        NOW_HMS_NUM=$(expr $(date +"%H%M%S") + 0)
-        if [ $NOW_HMS_NUM -lt $(expr $UPTIME_START + 0) ] || [ $NOW_HMS_NUM -gt $(expr $UPTIME_END + 0) ]; then
-          sleep 1
-          CONFIG_COUNTER=$((CONFIG_COUNTER + 1))
-          UPLOAD_TIMER=$((UPLOAD_TIMER - 1))
-          continue
-        fi
-      fi
-      if [ -n "$URL_QUEUE" ] && [ "$UPLOAD_TIMER" -le 0 ]; then
-        log_debug "loop: triggering upload (upload_timer=$UPLOAD_TIMER check_interval=$CHECK_INTERVAL)"
-        next_upload_url
-        capture_and_upload
-        # checkInterval <= 60 の場合、1回の sync で複数本の URL が配られる。
-        # 2本目以降は checkInterval 秒ごとに均等に消化する。
-        UPLOAD_TIMER=$CHECK_INTERVAL
-      fi
+      NEXT_SYNC_AT=$((NEXT_SYNC_AT + SYNC_INTERVAL))
+      # sync やファームのダウンロードが周期を超えて長引いた場合は、遅れた回数ぶんを
+      # 連続で取り戻さず、次のループで1回だけ sync する
+      read_monotonic
+      [ "$NEXT_SYNC_AT" -lt "${MONO_NOW%%.*}" ] && NEXT_SYNC_AT=${MONO_NOW%%.*}
     fi
 
     sleep 1
-    CONFIG_COUNTER=$((CONFIG_COUNTER + 1))
-    UPLOAD_TIMER=$((UPLOAD_TIMER - 1))
   done
 }
 

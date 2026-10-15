@@ -84,55 +84,76 @@ rollbackTimeout=600  # 省略時は 600（秒）
           │    └─ firmwareUpdate があれば apply_firmware_update
           │       （→ OTA セクション）
           │
-          └─ [isEnabled=true かつ URL_QUEUE が空でない]
-               ├─ camera-sync 直後、firstUploadDelay 秒待ってから
-               │  1本目を消化。2本目以降は checkInterval 秒ごと
-               ├─ uploadUrls キューから URL を 1 件取り出し
-               ├─ JPEG キャプチャ（/scripts/cmd jpeg）
-               ├─ tar アーカイブ作成（JPEG + contents.json）
-               └─ S3 pre-signed URL へ PUT アップロード
+          └─ [camera-sync が成功し isEnabled=true で uploadUrls があるとき]
+               バッチ（run_upload_batch）をバックグラウンド起動。メインループは待たない
+                └─ uploadUrls の i 本目を
+                   「sync した時刻 + firstUploadDelay + i × checkInterval」まで待って消化
+                    ├─ 一時停止中・稼働時間外・同時実行数の上限超過なら、その枠は捨てる
+                    └─ 撮影〜送信（capture_and_upload）をバックグラウンド起動。待たない
+                         ├─ JPEG キャプチャ（/scripts/cmd jpeg）
+                         ├─ tar アーカイブ作成（JPEG + contents.json）
+                         └─ S3 pre-signed URL へ PUT アップロード
 ```
 
-ファームウェアのダウンロードはこのループ内で同期的に行われるため、
-ダウンロード中（最大10分）は sync も画像アップロードも停止する。
+ファームウェアのダウンロードはメインループ内で同期的に行われるため、
+ダウンロード中（最大10分）は sync が止まる。発行済みのバッチは別プロセスなので
+手持ちの URL（最大で地平線 90 秒ぶん）は消化を続けるが、それが尽きると画像アップロードも止まる。
 
 ### アップロードタイミング
 
+プロセスは3層に分かれている。
+
+| 層 | 関数 | 役割 | 寿命 |
+|---|---|---|---|
+| メインループ | `run_daemon` | 60 秒ごとに camera-sync を呼ぶ | 常駐 |
+| バッチ | `run_upload_batch` | sync 1回ぶんの `uploadUrls` を時刻どおりに消化する | URL を使い切るまで（最大で地平線 90 秒程度） |
+| 撮影〜送信 | `capture_and_upload` | 撮影・加工・アップロード 1 回ぶん | 数秒（最大で curl のタイムアウト 30 秒） |
+
 次回撮影予定時刻はサーバがサーバ時計だけで管理しており、カメラはそれに依存しない
-「あと何秒で1本目を使うか」（`firstUploadDelay`）だけを受け取る。カメラ側は
-`UPLOAD_TIMER` という残り秒数のカウントダウンでこれを消化する。
+「あと何秒で1本目を使うか」（`firstUploadDelay`）だけを受け取る。バッチは i 本目を
 
-- `URL_QUEUE` が空のとき（起動直後、または前回分を消化しきったとき）だけ、
-  camera-sync のレスポンスで `UPLOAD_TIMER=$FIRST_UPLOAD_DELAY` に**再アンカー**し、
-  `URL_QUEUE` を新しいレスポンスの内容で置き換える
-- `URL_QUEUE` がまだ残っている場合は**上書きしない**。新しく配られた分は末尾に
-  追記するだけで、`UPLOAD_TIMER` のカウントダウンも触らない。camera-sync は
-  「次回撮影予定時刻」をサーバ側で前進させながら応答するため、期限がまだ来ていない
-  だけの正当な予約をここで上書きすると、二度と再配信されないまま消えてしまう
-- `UPLOAD_TIMER` はメインループの `sleep 1` と処理時間の分だけ実時間よりわずかに
-  遅れるが、次にキューが空になったタイミングでサーバ値により補正されるため
-  誤差は累積しない
-- `checkInterval <= 60` で1回の sync に複数本の URL が配られた場合、2本目以降は
-  `UPLOAD_TIMER=$CHECK_INTERVAL` で均等に消化する
+```
+sync した時刻 + firstUploadDelay + i × checkInterval
+```
 
-この方式に変える前は、`checkInterval` 秒ごとの判定をメインループのカウンタの剰余
-（`counter % checkInterval == 0`）で行っていた。このカウンタは camera-sync のたびに
-0 へリセットされるため、`checkInterval` が 60 の約数でない場合は
-「camera-sync 直後にしか URL を消化しない」実質的なバグになっており、
-送信間隔が設定値より最大1分近く短くなっていた。
+に撮影する。要点は次のとおり。
 
-「空のときだけ置き換え、残っていれば追記」にしているのも同じ理由の再発防止策。
-単純に毎回上書きする実装では、`checkInterval` が sync 周期（60秒）の倍数のときに
-撮影期限と sync のタイミングがちょうど重なり、期限が来ていた撮影がキューの
-上書きで消える／サーバは既にその枠を配信済み扱いにしているため二度と来ない、
-という形で2回目以降のアップロードが永久に発生しなくなる不具合があった。
+- **間隔は起動からの経過秒（`/proc/uptime`）で測る**。ループの回数では数えない。
+  カメラの壁時計は ntpd や `sync_clock_from_server` で飛ぶため、これも使わない
+- **撮影時刻は毎回上の式で求め直す**。前の撮影が終わった時刻を起点にしないので、
+  撮影・ffmpeg・アップロードに掛かった時間が間隔に上乗せされない
+- **撮影〜送信はバックグラウンド**。アップロードが `checkInterval` より長く掛かっても、
+  次の撮影は予定どおり始まる
+- **URL を溜める共有キューを持たない**。バッチは自分が受け取った URL だけを持ち、
+  使い切るか終了すれば消える。sync のたびにサーバ基準の時刻へ合わせ直されるので、
+  誤差は累積しない。サーバは次回撮影予定時刻を連続して管理しているため、
+  バッチ同士は隙間も重複もなく繋がる
+- 「sync した時刻」は、リクエスト送信と応答受信の中間とみなす。`firstUploadDelay` は
+  秒へ丸められているため、バッチの切り替わりでは最大 0.5 秒程度のずれが出る（累積はしない）
 
-`tests/test_mocula_timing.sh` が camera_sync / capture_and_upload をスタブ化し、
-実時間を消費せずに様々な `checkInterval`（60秒の約数・倍数を含む）でこの挙動を
-検証する（busybox ash、実機不要）。
+枠を捨てる条件（いずれも捨てたぶんを後から連写で取り戻すことはしない）:
+
+| 条件 | ログ |
+|---|---|
+| 予定時刻から 1 周期以上遅れた | `upload skipped: slot N is more than Xs late` |
+| 撮影〜送信が全バッチ合計で `MAX_PARALLEL_UPLOADS`（4）本走っている（`/var/run/mocula.uploads/` に PID を記録して数える） | `upload skipped: N uploads still in flight` |
+| 直近の sync が `isEnabled=false` を返した（`/var/run/mocula.paused` で伝える） | デバッグログのみ |
+| 稼働時間（`uptimeStart`〜`uptimeEnd`）の外 | デバッグログのみ |
+
+**以前の方式と、やめた理由**: 以前はメインループ 1 本で、`sleep 1` の回数を数える
+カウントダウン（`UPLOAD_TIMER`）と URL の共有キュー（`URL_QUEUE`）で消化していた。
+撮影〜送信が終わってから次のカウントダウンを始めるため、実際の周期は
+`checkInterval + 処理時間` になり、`checkInterval = 10` の設定で 12〜13 秒に 1 枚しか
+送れなかった。サーバは実時間どおりに URL を発行するのでキューに URL が溜まり続け、
+5 分の有効期限を超えた時点から全アップロードが `403 Request has expired` で失敗して
+自力では復旧しなかった（mocula-backend Issue #83）。
+
+`tests/test_mocula_timing.sh` が、時計と sleep をスタブ化した仮想時間と、実際の
+バックグラウンドプロセスの両方でこの挙動を検証する（実機不要）。実機の `mocula.sh` は
+bash で動くため、busybox ash と bash の両方で通すこと。
 
 ```sh
-busybox ash tests/test_mocula_timing.sh
+busybox ash tests/test_mocula_timing.sh && bash tests/test_mocula_timing.sh
 ```
 
 ---
@@ -232,6 +253,9 @@ Content-Type: application/json
 off にしている短い窓（実測 0.13 秒程度）とライブ視聴中の `mocula_live.sh` の
 `cmd jpeg 1` 呼び出しが重なると、そのライブフレーム 1 枚だけタイムスタンプが欠ける
 可能性がある。窓が短くライブ視聴中に限られるため実害は小さいと見て許容している。
+撮影〜送信はバックグラウンドで並行に走るが、off の窓は各撮影の冒頭にあり、撮影は
+`checkInterval` 間隔で始まるため、窓同士が重なることは通常ない（排他はしていない）。
+`cmd jpeg` の同時呼び出し自体は、libcallback 側のタスクキュー（8 件）が直列に処理する。
 
 `ffmpeg` の `drawtext` フィルタで日時を書き直す案も検討したが、実機のビルドには
 `drawtext` フィルタ自体が含まれていない（フォント合成に必要な `libharfbuzz` が無い）ため
