@@ -230,7 +230,7 @@ log() {
 # mocula.sh の load_config() は awk の出力を eval しているが、ここでは真似しない。
 # mconfig は SD カード上のファイルで任意の文字列が入りうるため、値は使う前に
 # 文字種を検査し、通らなければ「origin 層は判定しない」として失敗を返す。
-#   0: 標準出力に URL   1: mconfig 無し / 値が不正
+#   0: 標準出力に URL   1: mconfig 無し / origin 未設定 / 値が不正
 origin_url() {
   [ -f "$MCONFIG" ] || return 1
   _o=$(awk '
@@ -244,8 +244,8 @@ origin_url() {
       gsub(/^[ \t]+/, "", v) ; gsub(/[ \t\r]+$/, "", v)
       if (k == "origin" && v != "") { print v ; exit }
     }' "$MCONFIG" 2>/dev/null)
-  # origin を書いていない mconfig は mocula.sh と同じ既定値を使う
-  [ -z "$_o" ] && _o=https://app.mocula.jp
+  # origin を書いていない mconfig では mocula.sh も起動しないので、判定しない
+  [ -z "$_o" ] && return 1
   case "$_o" in
     *[!A-Za-z0-9:/._-]*) return 1 ;;
   esac
@@ -767,9 +767,8 @@ upper_layers() {
   ORIGIN_STATE=skipped
   # 判定より先に読んでおく。origin 層まで到達しなかった場合でも、どこを見に行く
   # 設定になっているのかは netdiag に残したい。
-  # mconfig が無いカメラ (mocula 未設定) では origin 層そのものを判定しない。
-  # mocula.sh の既定値へフォールバックすると、無関係なカメラが app.mocula.jp を
-  # 叩き続けることになるため。
+  # mconfig が無い、または origin を書いていないカメラ (mocula 未設定) では
+  # origin 層そのものを判定しない。
   ORIGIN_URL=$(origin_url) || ORIGIN_URL=""
   [ -z "$ORIGIN_URL" ] && ORIGIN_STATE=n/a
 

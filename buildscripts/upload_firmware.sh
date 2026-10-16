@@ -8,7 +8,8 @@
 # そのため既にオブジェクトがある場合は既定で拒否する。
 #
 # 任意の環境変数:
-#   MOCULA_IMAGE_BUCKET  配置先バケット。省略時は cdk/config/<stage>.yml の imageBucketName
+#   MOCULA_IMAGE_BUCKET  配置先バケット。省略時は private/config/<stage>.yml の imageBucketName
+#   MOCULA_PRIVATE_DIR   atomcam_tools-private の場所。省略時は <repo>/private
 #   AWS_ENDPOINT_URL     S3 エンドポイント。ローカル開発(floci)では http://localhost:4566
 #   FIRMWARE_FORCE       1 を指定すると既存オブジェクトを上書きする（危険。上記を理解した上で）
 
@@ -23,7 +24,9 @@ fi
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ZIP_FILE="$REPO_ROOT/atomcam_tools.zip"
 VERSION_FILE="$REPO_ROOT/configs/mocula.ver"
-CONFIG_FILE="$REPO_ROOT/cdk/config/$STAGE.yml"
+# 環境ごとの値は非公開リポジトリ atomcam_tools-private に置く（make private で private/ に取得）
+PRIVATE_DIR=${MOCULA_PRIVATE_DIR:-$REPO_ROOT/private}
+CONFIG_FILE="$PRIVATE_DIR/config/$STAGE.yml"
 
 if [ ! -f "$ZIP_FILE" ]; then
   echo "error: $ZIP_FILE not found. Run \"make build\" first." >&2
@@ -42,6 +45,7 @@ BUCKET=${MOCULA_IMAGE_BUCKET:-}
 if [ -z "$BUCKET" ]; then
   if [ ! -f "$CONFIG_FILE" ]; then
     echo "error: config not found: $CONFIG_FILE" >&2
+    echo "       Run \"make private\" to fetch atomcam_tools-private, or set MOCULA_PRIVATE_DIR." >&2
     exit 1
   fi
   BUCKET=$(sed -n 's/^imageBucketName:[[:space:]]*//p' "$CONFIG_FILE" | sed 's/[[:space:]]*#.*$//; s/^"//; s/"$//' | head -1)

@@ -47,7 +47,9 @@ firmware-upload:
 firmware-register:
 	./buildscripts/register_firmware.sh $(CONFIG)
 
-# cdk/ は firmware-deploy の初期実装。配置は aws s3 cp で足りるため通常は使わないが、
-# 参考として残してある（synth の動作確認用）
-firmware-cdk-synth:
-	cd cdk && npm install && npx cdk synth --context config=$(CONFIG)
+# 環境ごとの設定と mocula 固有の設計書は非公開リポジトリ atomcam_tools-private にある。
+# firmware-deploy / firmware-upload / firmware-register は private/config/<stage>.yml を読む
+PRIVATE_REPO ?= git@github.com:mocula-inc/atomcam_tools-private.git
+.PHONY: private
+private:
+	if [ -d private/.git ]; then git -C private pull --ff-only; else git clone $(PRIVATE_REPO) private; fi
