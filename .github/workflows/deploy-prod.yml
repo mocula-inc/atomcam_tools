@@ -1,8 +1,8 @@
-name: Deploy prod2
+name: Deploy prod
 
-# release-* タグの push では prod2 の登録状況と配置する zip を確かめるだけで、本番は変えない（plan）。
+# release-* タグの push では本番の登録状況と配置する zip を確かめるだけで、本番は変えない（plan）。
 # 確認したら、Actions 画面で「Use workflow from」にそのタグを選んで手動実行すると、
-# zip を prod2 に配置して登録する。登録しただけではカメラには配信されない（カメラごとに予約して初めて配信される）。
+# zip を選んだ本番環境に配置して登録する。登録しただけではカメラには配信されない（カメラごとに予約して初めて配信される）。
 #
 # 本番では再ビルドせず、main の Deploy ワークフローが qa1 / qa2 向けにビルドして保管した zip を使う。
 # 本番ロールは release-* タグからの実行しか引き受けられない（信頼ポリシーと反映手順は atomcam_tools-private）。
@@ -10,12 +10,21 @@ name: Deploy prod2
 #
 # このリポジトリは公開されていてログも誰でも読めるため、本番のバケット名・API の URL・アカウント ID は
 # ログに出さない（private の設定から読んだ値は add-mask し、ロールの ARN は secret に置く）
+#
+# 本番環境（prod1 / prod2 …）ごとに動く。タグの push では全環境の plan を出し、手動実行ではデプロイ先を選ぶ。
+# 環境を増やすときは、下の inputs.environment の options と、jobs.deploy.strategy.matrix の一覧の両方に足す
 on:
   push:
     tags:
       - release-*
   workflow_dispatch:
     inputs:
+      environment:
+        description: デプロイ先
+        type: choice
+        required: true
+        options:
+          - prod2
       confirm:
         description: 確認のため、「Use workflow from」で選んだタグ名をもう一度入力する
         type: string
@@ -27,20 +36,26 @@ permissions:
 
 env:
   AWS_REGION: ap-northeast-1
-  STAGE: prod2
-  # mocula-backend の scripts/put-secrets.sh が登録するファームウェア登録 API の API キー
-  API_KEY_SECRET_ID: prod2-apne1-firmware-deploy
 
 jobs:
   deploy:
-    name: ${{ github.event_name == 'workflow_dispatch' && 'Deploy' || 'Plan' }} prod2
+    name: ${{ github.event_name == 'workflow_dispatch' && 'Deploy' || 'Plan' }} ${{ matrix.environment }}
     # fork では AWS のロールを引き受けられないので動かさない
     if: github.repository == 'mocula-inc/atomcam_tools'
+    strategy:
+      fail-fast: false
+      matrix:
+        # タグの push では全本番環境の plan を出す。inputs.environment の options と揃える
+        environment: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('["{0}"]', inputs.environment) || '["prod2"]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:
-      group: deploy-prod2
+      group: deploy-${{ matrix.environment }}
       cancel-in-progress: false
+    env:
+      STAGE: ${{ matrix.environment }}
+      # mocula-backend の scripts/put-secrets.sh が登録するファームウェア登録 API の API キー
+      API_KEY_SECRET_ID: ${{ matrix.environment }}-apne1-firmware-deploy
     steps:
       - name: Check ref
         env:
