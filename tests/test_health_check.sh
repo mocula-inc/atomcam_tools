@@ -45,7 +45,7 @@ setup() {
   printf 'network={\n  ssid="TestAP"\n}\n' > "$WORK/configs/etc/wpa_supplicant.conf"
   printf 'Inter-| sta-|   Quality\n face | link | level\n wlan0: 0000   52.  -52.\n' \
     > "$WORK/proc/net/wireless"
-  printf '[global]\ntenantKey=t\ncameraKey=c\norigin=https://app.mocula.jp\n' \
+  printf '[global]\ntenantKey=t\ncameraKey=c\norigin=https://api.example.com\n' \
     > "$WORK/media/mmc/mconfig"
   printf 'nameserver 192.168.1.1\n' > "$WORK/tmp/resolv.conf"
   # スタブの挙動を切り替えるフラグ
@@ -317,10 +317,10 @@ origin_of() { # mconfig の中身を stdin から受け取り、origin_url の�
 }
 
 check "6-1 通常" "https://qa.example.com" "$(printf '[global]\ntenantKey=t\norigin=https://qa.example.com\n' | origin_of)"
-check "6-2 origin 未設定なら既定値" "https://app.mocula.jp" "$(printf '[global]\ntenantKey=t\n' | origin_of)"
-check "6-3 [global] が無ければ既定値" "https://app.mocula.jp" "$(printf 'origin=https://evil.example\n' | origin_of)"
-check "6-4 別セクションの origin は拾わない" "https://app.mocula.jp" "$(printf '[global]\nt=1\n[firmware]\norigin=https://evil.example\n' | origin_of)"
-check "6-5 前後の空白と CR を落とす" "https://app.mocula.jp" "$(printf '[global]\r\norigin =  https://app.mocula.jp  \r\n' | origin_of)"
+check "6-2 origin 未設定なら判定しない" "<invalid>" "$(printf '[global]\ntenantKey=t\n' | origin_of)"
+check "6-3 [global] が無ければ判定しない" "<invalid>" "$(printf 'origin=https://evil.example\n' | origin_of)"
+check "6-4 別セクションの origin は拾わない" "<invalid>" "$(printf '[global]\nt=1\n[firmware]\norigin=https://evil.example\n' | origin_of)"
+check "6-5 前後の空白と CR を落とす" "https://api.example.com" "$(printf '[global]\r\norigin =  https://api.example.com  \r\n' | origin_of)"
 check "6-6 ポートとパス" "https://x.example:8443/base" "$(printf '[global]\norigin=https://x.example:8443/base\n' | origin_of)"
 # origin は camera-sync の URL の前半として使うだけなのでクエリ文字は許可しない。
 # 値そのものは最初の = より後ろを全部拾えている (弾いているのは文字種検査)。
@@ -334,10 +334,10 @@ rm -f "$WORK/media/mmc/mconfig"
 check "6-11 mconfig 無しは失敗" "<invalid>" "$( ( HC_ROOT=$WORK ; . "$FUNCTIONS_FILE" ; origin_url || echo '<invalid>' ) )"
 
 host_of() { ( HC_ROOT=$WORK ; . "$FUNCTIONS_FILE" ; origin_host "$1" ); }
-check "6-12 host: https" "app.mocula.jp" "$(host_of https://app.mocula.jp)"
-check "6-13 host: パス付き" "app.mocula.jp" "$(host_of https://app.mocula.jp/api/v1)"
+check "6-12 host: https" "api.example.com" "$(host_of https://api.example.com)"
+check "6-13 host: パス付き" "api.example.com" "$(host_of https://api.example.com/api/v1)"
 check "6-14 host: ポート付き" "x.example:8443" "$(host_of https://x.example:8443/a)"
-check "6-15 host: スキーム無し" "app.mocula.jp" "$(host_of app.mocula.jp)"
+check "6-15 host: スキーム無し" "api.example.com" "$(host_of api.example.com)"
 
 # ==================================================================
 # シナリオ 7: http_date_to_epoch() 単体
@@ -706,7 +706,7 @@ check "15-13 CAPTIVE_PORTAL では落とさない" 0 "$(count_lines $WORK/rec/re
 setup
 STUB_PING_GW=ok ; STUB_ORIGIN_CURL=6 ; STUB_ORIGIN_CODE=000
 set_uptime 130 ; run_hc
-check "15-14 ORIGIN_DNS_FAILED と分類" 1 "$(count_match "$(logfile)" 'cause=ORIGIN_DNS_FAILED origin=app.mocula.jp')"
+check "15-14 ORIGIN_DNS_FAILED と分類" 1 "$(count_match "$(logfile)" 'cause=ORIGIN_DNS_FAILED origin=api.example.com')"
 check "15-15 DNS_FAILED と誤診しない" 0 "$(count_match "$(logfile)" 'cause=DNS_FAILED')"
 check "15-16 DHCP RENEW を打たない" 0 "$(count_lines $WORK/rec/kick_dhcp)"
 set_uptime 3800 ; run_hc

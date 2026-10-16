@@ -34,7 +34,7 @@ load_config() {
     /^\[/ { section=$0; gsub(/\[/, "", section); gsub(/\]/, "", section); next }
     /^[a-zA-Z]/ { printf "%s_%s=%s\n", section, $1, $2 }
   ' /media/mmc/mconfig)
-  API_ORIGIN="${global_origin:-https://app.mocula.jp}"
+  API_ORIGIN="$global_origin"
   TENANT_KEY="$global_tenantKey"
   CAMERA_KEY="$global_cameraKey"
   DEBUG_MODE="${global_debug:-0}"
@@ -543,6 +543,7 @@ case "$1" in
     [ "$LIVE_DISABLED" = "1" ] && exit 0
     [ -f "$DISABLEFILE" ] && exit 0
     [ -z "$TENANT_KEY" ] || [ -z "$CAMERA_KEY" ] && { log "start: tenantKey/cameraKey not set"; exit 1; }
+    [ -z "$API_ORIGIN" ] && { log "start: origin not set"; exit 1; }
     session_id="$2"
     [ -z "$session_id" ] && { log "start: no session id"; exit 1; }
 

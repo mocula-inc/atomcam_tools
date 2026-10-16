@@ -86,6 +86,7 @@ new_work() {
 [global]
 tenantKey=test-tenant
 cameraKey=test-camera
+origin=https://api.example.com
 CONF
 }
 
