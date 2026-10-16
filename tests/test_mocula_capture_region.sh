@@ -3,7 +3,7 @@
 # camera-sync レスポンスのパース(parse_capture_region)と、撮影経路の切り替え・
 # タイムスタンプ OSD のオンオフ・失敗時フォールバック(capture_jpeg)を、
 # /scripts/cmd と ffmpeg をスタブ化することで実機無しで検証する
-# （→ atom-linked-firefly.md 実装計画、mocula.md「タイムスタンプ(OSD)の扱い」参照）。
+# （→ atom-linked-firefly.md 実装計画、atomcam_tools-private の docs/mocula.md「タイムスタンプ(OSD)の扱い」参照）。
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 SCRIPT=$REPO/overlay_rootfs/scripts/mocula.sh

@@ -108,13 +108,13 @@ load_config() {
     /^[a-zA-Z]/ { printf "%s_%s=%s\n", section, $1, $2 }
   ' $MCONFIG)
 
-  API_ORIGIN="${global_origin:-https://app.mocula.jp}"
+  API_ORIGIN="$global_origin"
   TENANT_KEY="$global_tenantKey"
   CAMERA_KEY="$global_cameraKey"
   ROLLBACK_TIMEOUT="${firmware_rollbackTimeout:-600}"
   # サーバ時刻によるカメラ時計のフォールバック補正の閾値(秒)。0 で無効化。
   # 常駐 ntpd (S42ntpd) と綱引きにならないよう、既定は大きめにしてある。
-  # → mocula.md の「時刻同期」参照
+  # → atomcam_tools-private の docs/mocula.md の「時刻同期」参照
   CLOCK_SKEW_THRESHOLD="${global_clockSkewThreshold:-60}"
 }
 
@@ -179,7 +179,7 @@ parse_firmware_update_offer() {
 
 # デジタルズーム(取得範囲指定)。captureRegion は firmwareUpdate と同様レスポンスに無ければ
 # 省略されるフィールドなので、CAPTURE_* は毎回リセットしてから解析する(前回値の持ち越しを防ぐ)。
-# 高さは 16:9 から height = width * 9 / 16 で一意に導出するため持たない(→ mocula.md 参照)。
+# 高さは 16:9 から height = width * 9 / 16 で一意に導出するため持たない(→ atomcam_tools-private の docs/mocula.md 参照)。
 # サーバ側が権威だが、値は後段で ffmpeg のコマンドラインへ直接入るため、ここでも独立に
 # 範囲検証する(多重防御)。x/y は sed のパターン([0-9]、符号なし)により非負であることが
 # 構文上保証されるため、負値チェックは不要。
@@ -389,7 +389,7 @@ spawn_upload() {
 # i 本目の撮影時刻は「sync した時刻 + firstUploadDelay + i * checkInterval」。毎回この式で
 # 求め直し、前の撮影が終わった時刻を起点にしないので、処理時間が間隔に上乗せされない。
 # サーバは次回撮影予定時刻を連続して管理しているため、バッチ同士は隙間も重複もなく繋がる
-# (→ mocula.md の「アップロードタイミング」参照)。
+# (→ atomcam_tools-private の docs/mocula.md の「アップロードタイミング」参照)。
 run_upload_batch() {
   case "$CHECK_INTERVAL" in
     '' | *[!0-9]*) log "upload batch: invalid checkInterval [$CHECK_INTERVAL]"; return 1 ;;
@@ -435,7 +435,7 @@ JPEG_QUALITY=5  # ffmpeg -q:v。5 で ch1 ネイティブ相当(-q:v 8)よりや
 # CAPTURE_W が空(=ズーム未設定)なら従来通り ch1 をそのまま使う。
 # ズーム設定時は ch0(1920x1080)を取得し、指定範囲を切り出して 640x360 に縮小する。
 # その際、OSD タイムスタンプは範囲によって半端に写り込むため撮影の瞬間だけ消す
-# (→ mocula.md の「タイムスタンプ(OSD)の扱い」参照)。osdSwitch はチャンネル共通の
+# (→ atomcam_tools-private の docs/mocula.md の「タイムスタンプ(OSD)の扱い」参照)。osdSwitch はチャンネル共通の
 # グローバル設定なので、off にする窓は「ch0 を取得するまで」に絞り、ffmpeg の
 # crop/scale(数百ms)はこの窓に含めない。
 capture_jpeg() {
@@ -672,6 +672,10 @@ run_daemon() {
 
   if [ -z "$TENANT_KEY" ] || [ -z "$CAMERA_KEY" ]; then
     log "tenantKey or cameraKey not configured"
+    exit 1
+  fi
+  if [ -z "$API_ORIGIN" ]; then
+    log "origin not configured"
     exit 1
   fi
 

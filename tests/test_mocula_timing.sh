@@ -1,7 +1,7 @@
 #!/bin/busybox ash
 # mocula.sh が、camera-sync から受け取る firstUploadDelay / checkInterval / uploadUrls を
 # 設定した checkInterval どおりの間隔で消化するかを検証する
-# （→ mocula.md の「アップロードタイミング」参照）。
+# （→ atomcam_tools-private の docs/mocula.md の「アップロードタイミング」参照）。
 #
 # 構造は「run_daemon(60秒ごとに sync) → run_upload_batch(sync 1回ぶんの URL を時刻どおりに
 # 消化) → capture_and_upload(撮影〜送信、バックグラウンド)」の3層。前半は時計と sleep を
@@ -86,6 +86,7 @@ new_work() {
 [global]
 tenantKey=test-tenant
 cameraKey=test-camera
+origin=https://api.example.com
 CONF
 }
 
