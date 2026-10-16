@@ -81,6 +81,19 @@ jobs:
           path: private
           ssh-key: ${{ secrets.ATOMCAM_TOOLS_PRIVATE_DEPLOY_KEY }}
           persist-credentials: false
+      # 公開リポジトリの Actions のログは誰でも読めるため、非公開の設定値（バケット名・URL）と
+      # そのホスト名をこれ以降のログで伏せる。伏せた値を含む job output は GitHub が渡さないので、
+      # ジョブ間ではファイル名だけを渡し、URI は各ジョブで private/config から組み立てる
+      - name: Mask private config
+        run: |
+          sed -n 's/^[A-Za-z][A-Za-z0-9_]*:[[:space:]]*//p' private/config/*.yml |
+            sed 's/[[:space:]]*#.*$//; s/^"//; s/"$//' |
+            while IFS= read -r v; do
+              [ -n "$v" ] || continue
+              echo "::add-mask::$v"
+              h=$(printf '%s' "$v" | sed -e 's|^[A-Za-z][A-Za-z0-9+.-]*://||' -e 's|[/?#].*$||')
+              [ -n "$h" ] && [ "$h" != "$v" ] && echo "::add-mask::$h"
+            done
       - name: Resolve target
         id: target
         run: |
@@ -110,7 +123,7 @@ jobs:
     env:
       NEEDED: ${{ contains(toJSON(needs.check.outputs), 'unregistered') }}
     outputs:
-      object: ${{ steps.object.outputs.uri }}
+      object: ${{ steps.object.outputs.name }}
       needed: ${{ env.NEEDED }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -123,6 +136,19 @@ jobs:
           path: private
           ssh-key: ${{ secrets.ATOMCAM_TOOLS_PRIVATE_DEPLOY_KEY }}
           persist-credentials: false
+      # 公開リポジトリの Actions のログは誰でも読めるため、非公開の設定値（バケット名・URL）と
+      # そのホスト名をこれ以降のログで伏せる。伏せた値を含む job output は GitHub が渡さないので、
+      # ジョブ間ではファイル名だけを渡し、URI は各ジョブで private/config から組み立てる
+      - name: Mask private config
+        run: |
+          sed -n 's/^[A-Za-z][A-Za-z0-9_]*:[[:space:]]*//p' private/config/*.yml |
+            sed 's/[[:space:]]*#.*$//; s/^"//; s/"$//' |
+            while IFS= read -r v; do
+              [ -n "$v" ] || continue
+              echo "::add-mask::$v"
+              h=$(printf '%s' "$v" | sed -e 's|^[A-Za-z][A-Za-z0-9+.-]*://||' -e 's|[/?#].*$||')
+              [ -n "$h" ] && [ "$h" != "$v" ] && echo "::add-mask::$h"
+            done
       - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
           role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
@@ -158,10 +184,12 @@ jobs:
             fi
             echo "found=true" >> "$GITHUB_OUTPUT"
             echo "uri=s3://$BUCKET/$EXISTING" >> "$GITHUB_OUTPUT"
+            echo "name=${EXISTING##*/}" >> "$GITHUB_OUTPUT"
             echo "::notice::保管済みの s3://$BUCKET/$EXISTING を使います"
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
             echo "uri=s3://$BUCKET/${PREFIX}${COMMIT:0:7}.zip" >> "$GITHUB_OUTPUT"
+            echo "name=atomcam_tools_${VERSION}_${COMMIT:0:7}.zip" >> "$GITHUB_OUTPUT"
           fi
       - name: Free disk space
         if: env.NEEDED == 'true' && steps.object.outputs.found == 'false'
@@ -213,7 +241,7 @@ jobs:
       STAGE: ${{ matrix.environment }}
       COMMIT: ${{ needs.check.outputs.commit }}
       VERSION: ${{ needs.check.outputs.version }}
-      OBJECT: ${{ needs.build.outputs.object }}
+      OBJECT_NAME: ${{ needs.build.outputs.object }}
       MOCULA_FIRMWARE_API_KEY: ${{ secrets.MOCULA_FIRMWARE_API_KEY }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -226,6 +254,19 @@ jobs:
           path: private
           ssh-key: ${{ secrets.ATOMCAM_TOOLS_PRIVATE_DEPLOY_KEY }}
           persist-credentials: false
+      # 公開リポジトリの Actions のログは誰でも読めるため、非公開の設定値（バケット名・URL）と
+      # そのホスト名をこれ以降のログで伏せる。伏せた値を含む job output は GitHub が渡さないので、
+      # ジョブ間ではファイル名だけを渡し、URI は各ジョブで private/config から組み立てる
+      - name: Mask private config
+        run: |
+          sed -n 's/^[A-Za-z][A-Za-z0-9_]*:[[:space:]]*//p' private/config/*.yml |
+            sed 's/[[:space:]]*#.*$//; s/^"//; s/"$//' |
+            while IFS= read -r v; do
+              [ -n "$v" ] || continue
+              echo "::add-mask::$v"
+              h=$(printf '%s' "$v" | sed -e 's|^[A-Za-z][A-Za-z0-9+.-]*://||' -e 's|[/?#].*$||')
+              [ -n "$h" ] && [ "$h" != "$v" ] && echo "::add-mask::$h"
+            done
       # 先行する実行が同じバージョンを登録し終えていることがあるため、順番が回ってきてから確かめ直す
       - name: Check registration
         id: status
@@ -243,7 +284,17 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
       - name: Fetch firmware
         if: steps.status.outputs.status == 'unregistered'
-        run: aws s3 cp "$OBJECT" atomcam_tools.zip --only-show-errors
+        run: |
+          FIRMWARE_STORE=$(sed -n 's/^firmwareStore:[[:space:]]*//p' private/config/build.yml | sed 's/[[:space:]]*#.*$//; s/^"//; s/"$//' | head -1)
+          case "$FIRMWARE_STORE" in
+            s3://?*) ;;
+            *) echo "::error::private/config/build.yml の firmwareStore が不正です"; exit 1 ;;
+          esac
+          case "$OBJECT_NAME" in
+            atomcam_tools_*.zip) ;;
+            *) echo "::error::build ジョブから保管先のファイル名を受け取れませんでした: '$OBJECT_NAME'"; exit 1 ;;
+          esac
+          aws s3 cp "${FIRMWARE_STORE%/}/$OBJECT_NAME" atomcam_tools.zip --only-show-errors
       - name: Upload firmware
         if: steps.status.outputs.status == 'unregistered'
         env:
@@ -261,5 +312,5 @@ jobs:
             echo
             echo "- commit: \`$COMMIT\`"
             echo "- sha256: \`$(sha256sum atomcam_tools.zip | awk '{print $1}')\`"
-            echo "- build: \`$OBJECT\`"
+            echo "- build: \`$OBJECT_NAME\`"
           } >> "$GITHUB_STEP_SUMMARY"
