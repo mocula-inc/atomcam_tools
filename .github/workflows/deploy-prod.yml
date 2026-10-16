@@ -30,6 +30,11 @@ on:
         type: string
         required: true
 
+# shell を指定しない run は bash -e で動き、pipefail が付かない（cmd | tee のような処理で cmd の失敗を見逃す）
+defaults:
+  run:
+    shell: bash
+
 permissions:
   id-token: write
   contents: read
@@ -64,7 +69,7 @@ jobs:
           CONFIRM: ${{ inputs.confirm }}
         run: |
           if [ "$REF_TYPE" != "tag" ] || [[ "$REF_NAME" != release-* ]]; then
-            echo "::error::release-* タグから実行してください（今の ref: $REF_TYPE $REF_NAME）"
+            echo "::error::release-* タグから実行してください（今の ref: $REF_TYPE $REF_NAME）。手動実行では「Use workflow from」で Tags に切り替えてタグを選びます"
             exit 1
           fi
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$CONFIRM" != "$REF_NAME" ]; then
