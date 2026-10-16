@@ -1,0 +1,183 @@
+name: Deploy prod
+
+# release-* タグの push では本番の登録状況と配置する zip を確かめるだけで、本番は変えない（plan）。
+# 確認したら、Actions 画面で「Use workflow from」にそのタグを選んで手動実行すると、
+# zip を選んだ本番環境に配置して登録する。登録しただけではカメラには配信されない（カメラごとに予約して初めて配信される）。
+#
+# 本番では再ビルドせず、main の Deploy ワークフローが qa1 / qa2 向けにビルドして保管した zip を使う。
+# 本番ロールは release-* タグからの実行しか引き受けられない（信頼ポリシーと反映手順は atomcam_tools-private）。
+# このジョブに environment を付けると OIDC の sub が変わってロールを引き受けられなくなるので付けないこと。
+#
+# このリポジトリは公開されていてログも誰でも読めるため、本番のバケット名・API の URL・アカウント ID は
+# ログに出さない（private の設定から読んだ値は add-mask し、ロールの ARN は secret に置く）
+#
+# 本番環境（prod1 / prod2 …）ごとに動く。タグの push では全環境の plan を出し、手動実行ではデプロイ先を選ぶ。
+# 環境を増やすときは、下の inputs.environment の options と、jobs.deploy.strategy.matrix の一覧の両方に足す
+on:
+  push:
+    tags:
+      - release-*
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: デプロイ先
+        type: choice
+        required: true
+        options:
+          - prod2
+      confirm:
+        description: 確認のため、「Use workflow from」で選んだタグ名をもう一度入力する
+        type: string
+        required: true
+
+# shell を指定しない run は bash -e で動き、pipefail が付かない（cmd | tee のような処理で cmd の失敗を見逃す）
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-1
+
+jobs:
+  deploy:
+    name: ${{ github.event_name == 'workflow_dispatch' && 'Deploy' || 'Plan' }} ${{ matrix.environment }}
+    # fork では AWS のロールを引き受けられないので動かさない
+    if: github.repository == 'mocula-inc/atomcam_tools'
+    strategy:
+      fail-fast: false
+      matrix:
+        # タグの push では全本番環境の plan を出す。inputs.environment の options と揃える
+        environment: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('["{0}"]', inputs.environment) || '["prod2"]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: deploy-${{ matrix.environment }}
+      cancel-in-progress: false
+    env:
+      STAGE: ${{ matrix.environment }}
+      # mocula-backend の scripts/put-secrets.sh が登録するファームウェア登録 API の API キー
+      API_KEY_SECRET_ID: ${{ matrix.environment }}-apne1-firmware-deploy
+    steps:
+      - name: Check ref
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$REF_TYPE" != "tag" ] || [[ "$REF_NAME" != release-* ]]; then
+            echo "::error::release-* タグから実行してください（今の ref: $REF_TYPE $REF_NAME）。手動実行では「Use workflow from」で Tags に切り替えてタグを選びます"
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$CONFIRM" != "$REF_NAME" ]; then
+            echo "::error::確認用の入力（$CONFIRM）が選んだタグ（$REF_NAME）と一致しません"
+            exit 1
+          fi
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # main に含まれるかを確かめるために全履歴を取る
+          fetch-depth: 0
+      # main の Deploy で qa1 / qa2 に出ていないコミットは本番に出さない
+      - name: Check commit is on main
+        run: |
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::$(git rev-parse HEAD) は main に含まれていません"
+            exit 1
+          fi
+      # 環境ごとの設定（バケット名・API の URL など）は非公開リポジトリに置いている
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: mocula-inc/atomcam_tools-private
+          path: private
+          ssh-key: ${{ secrets.ATOMCAM_TOOLS_PRIVATE_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: Resolve target
+        run: |
+          readValue() {
+            sed -n "s/^$1:[[:space:]]*//p" "$2" | sed 's/[[:space:]]*#.*$//; s/^"//; s/"$//' | head -1
+          }
+          FIRMWARE_STORE=$(readValue firmwareStore private/config/build.yml)
+          case "$FIRMWARE_STORE" in
+            s3://?*) ;;
+            *) echo "::error::private/config/build.yml の firmwareStore が不正です"; exit 1 ;;
+          esac
+          STORE_BUCKET=${FIRMWARE_STORE#s3://}
+          echo "::add-mask::${STORE_BUCKET%%/*}"
+          for VALUE in "$(readValue imageBucketName "private/config/$STAGE.yml")" "$(readValue apiOrigin "private/config/$STAGE.yml")"; do
+            if [ -z "$VALUE" ]; then
+              echo "::error::private/config/$STAGE.yml に imageBucketName と apiOrigin が必要です"
+              exit 1
+            fi
+            echo "::add-mask::$VALUE"
+            # apiOrigin はホスト名だけでも出ないようにする
+            echo "::add-mask::${VALUE#*://}"
+          done
+          {
+            echo "FIRMWARE_STORE=$FIRMWARE_STORE"
+            echo "COMMIT=$(git rev-parse HEAD)"
+            echo "VERSION=$(tr -d ' \t\r\n' < configs/mocula.ver)"
+          } >> "$GITHUB_ENV"
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+      - name: Load API key
+        run: |
+          API_KEY=$(aws secretsmanager get-secret-value --secret-id "$API_KEY_SECRET_ID" --query SecretString --output text | tr -d '\r\n')
+          if [ -z "$API_KEY" ]; then
+            echo "::error::$API_KEY_SECRET_ID が空です（mocula-backend の scripts/put-secrets.sh で登録する）"
+            exit 1
+          fi
+          echo "::add-mask::$API_KEY"
+          echo "MOCULA_FIRMWARE_API_KEY=$API_KEY" >> "$GITHUB_ENV"
+      - name: Check registration
+        id: status
+        run: |
+          STATUS=$(./buildscripts/register_firmware.sh "$STAGE" --check)
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          if [ "$STATUS" = "registered" ]; then
+            echo "::notice::$STAGE: $VERSION は登録済みのため何もしません"
+            echo "$STAGE: $VERSION は登録済みのため何もしません" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      # 同じバージョンの zip は 1 つしか保管されない（別のコミットから同じバージョンを作ると main の Deploy が失敗する）
+      - name: Fetch firmware
+        if: steps.status.outputs.status == 'unregistered'
+        run: |
+          BUCKET=${FIRMWARE_STORE#s3://}
+          PREFIX=${BUCKET#*/}/atomcam_tools_${VERSION}_
+          BUCKET=${BUCKET%%/*}
+          # shellcheck disable=SC2016
+          KEYS=$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$PREFIX" \
+            --query 'Contents[].Key' --output text | tr '\t' '\n')
+          # 前方一致では 1.2.3 が 1.2.3_rc の分まで拾うので、名前全体で確かめる
+          KEY=$(printf '%s\n' "$KEYS" | grep -E -x -m 1 "${PREFIX//./\\.}[0-9a-f]{7}\.zip" || true)
+          if [ -z "$KEY" ]; then
+            echo "::error::$VERSION の zip が保管されていません。main の Deploy ワークフローが成功しているか確認してください"
+            exit 1
+          fi
+          aws s3 cp "s3://$BUCKET/$KEY" atomcam_tools.zip --only-show-errors
+          {
+            echo "## $STAGE: ${GITHUB_REF_NAME}"
+            echo
+            echo "- version: \`$VERSION\`（未登録）"
+            echo "- commit: \`$COMMIT\`"
+            echo "- zip: \`$(basename "$KEY")\`"
+            echo "- sha256: \`$(sha256sum atomcam_tools.zip | awk '{print $1}')\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload firmware
+        if: github.event_name == 'workflow_dispatch' && steps.status.outputs.status == 'unregistered'
+        env:
+          # 未登録と確かめた直後なので、登録に失敗した前回の実行が残したオブジェクトは置き換えてよい
+          FIRMWARE_FORCE: "1"
+        run: ./buildscripts/upload_firmware.sh "$STAGE"
+      - name: Register firmware
+        if: github.event_name == 'workflow_dispatch' && steps.status.outputs.status == 'unregistered'
+        env:
+          FIRMWARE_NOTE: GitHub Actions (${{ github.ref_name }})
+        run: |
+          ./buildscripts/register_firmware.sh "$STAGE"
+          echo "登録しました。カメラへの配信は、カメラごとに予約して行います" >> "$GITHUB_STEP_SUMMARY"
