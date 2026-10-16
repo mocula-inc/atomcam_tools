@@ -9,7 +9,7 @@ name: Deploy prod
 # このジョブに environment を付けると OIDC の sub が変わってロールを引き受けられなくなるので付けないこと。
 #
 # このリポジトリは公開されていてログも誰でも読めるため、本番のバケット名・API の URL・アカウント ID は
-# ログに出さない（private の設定から読んだ値は add-mask し、ロールの ARN は secret に置く）
+# ログに出さない（private の設定の値はすべて add-mask し、ロールの ARN は secret に置く）
 #
 # 本番環境（prod1 / prod2 …）ごとに動く。タグの push では全環境の plan を出し、手動実行ではデプロイ先を選ぶ。
 # 環境を増やすときは、下の inputs.environment の options と、jobs.deploy.strategy.matrix の一覧の両方に足す
@@ -94,6 +94,21 @@ jobs:
           path: private
           ssh-key: ${{ secrets.ATOMCAM_TOOLS_PRIVATE_DEPLOY_KEY }}
           persist-credentials: false
+      # 公開リポジトリの Actions のログは誰でも読めるため、非公開の設定値（バケット名・URL）と
+      # そのホスト名をこれ以降のログで伏せる（deploy.yml と同じ処理）
+      - name: Mask private config
+        run: |
+          sed -n 's/^[A-Za-z][A-Za-z0-9_]*:[[:space:]]*//p' private/config/*.yml |
+            sed 's/[[:space:]]*#.*$//; s/^"//; s/"$//' |
+            while IFS= read -r v; do
+              [ -n "$v" ] || continue
+              echo "::add-mask::$v"
+              h=$(printf '%s' "$v" | sed -e 's|^[A-Za-z][A-Za-z0-9+.-]*://||' -e 's|[/?#].*$||')
+              # && でつなぐと、最後の値がホスト名と同じとき（スキームの無いバケット名など）にループが失敗で終わる
+              if [ -n "$h" ] && [ "$h" != "$v" ]; then
+                echo "::add-mask::$h"
+              fi
+            done
       - name: Resolve target
         run: |
           readValue() {
@@ -104,16 +119,11 @@ jobs:
             s3://?*) ;;
             *) echo "::error::private/config/build.yml の firmwareStore が不正です"; exit 1 ;;
           esac
-          STORE_BUCKET=${FIRMWARE_STORE#s3://}
-          echo "::add-mask::${STORE_BUCKET%%/*}"
-          for VALUE in "$(readValue imageBucketName "private/config/$STAGE.yml")" "$(readValue apiOrigin "private/config/$STAGE.yml")"; do
-            if [ -z "$VALUE" ]; then
-              echo "::error::private/config/$STAGE.yml に imageBucketName と apiOrigin が必要です"
+          for KEY in imageBucketName apiOrigin; do
+            if [ -z "$(readValue "$KEY" "private/config/$STAGE.yml")" ]; then
+              echo "::error::private/config/$STAGE.yml に $KEY が必要です"
               exit 1
             fi
-            echo "::add-mask::$VALUE"
-            # apiOrigin はホスト名だけでも出ないようにする
-            echo "::add-mask::${VALUE#*://}"
           done
           {
             echo "FIRMWARE_STORE=$FIRMWARE_STORE"
