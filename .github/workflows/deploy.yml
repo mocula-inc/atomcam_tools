@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: 登録先（cdk/config/<name>.yml）
+        description: 登録先（atomcam_tools-private の config/<name>.yml）
         type: choice
         required: true
         options:
@@ -41,8 +41,6 @@ permissions:
 
 env:
   AWS_REGION: ap-northeast-1
-  # ビルドした zip の保管先。同じバージョンのものがあればここから取り出し、ビルドし直さない
-  FIRMWARE_STORE: s3://storage.mocula-devs.com/atomcam_tools
 
 jobs:
   # configs/mocula.ver のバージョンが登録済みの環境には何もしない。
@@ -76,6 +74,13 @@ jobs:
         run: |
           COMMIT=$(git rev-parse --verify --quiet "origin/${TARGET_REF}^{commit}" || git rev-parse --verify "${TARGET_REF}^{commit}")
           git checkout --detach "$COMMIT"
+      # 環境ごとの設定（バケット名・API の URL など）は非公開リポジトリに置いている
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: mocula-inc/atomcam_tools-private
+          path: private
+          ssh-key: ${{ secrets.ATOMCAM_TOOLS_PRIVATE_DEPLOY_KEY }}
+          persist-credentials: false
       - name: Resolve target
         id: target
         run: |
@@ -111,6 +116,13 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ needs.check.outputs.commit }}
+      # 環境ごとの設定（バケット名・API の URL など）は非公開リポジトリに置いている
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: mocula-inc/atomcam_tools-private
+          path: private
+          ssh-key: ${{ secrets.ATOMCAM_TOOLS_PRIVATE_DEPLOY_KEY }}
+          persist-credentials: false
       - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
           role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
@@ -124,6 +136,12 @@ jobs:
           COMMIT: ${{ needs.check.outputs.commit }}
           VERSION: ${{ needs.check.outputs.version }}
         run: |
+          # ビルドした zip の保管先。同じバージョンのものがあればここから取り出し、ビルドし直さない
+          FIRMWARE_STORE=$(sed -n 's/^firmwareStore:[[:space:]]*//p' private/config/build.yml | sed 's/[[:space:]]*#.*$//; s/^"//; s/"$//' | head -1)
+          case "$FIRMWARE_STORE" in
+            s3://?*) ;;
+            *) echo "::error::private/config/build.yml の firmwareStore が不正です: '$FIRMWARE_STORE'"; exit 1 ;;
+          esac
           BUCKET=${FIRMWARE_STORE#s3://}
           PREFIX=${BUCKET#*/}/atomcam_tools_${VERSION}_
           BUCKET=${BUCKET%%/*}
@@ -201,6 +219,13 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ needs.check.outputs.commit }}
+      # 環境ごとの設定（バケット名・API の URL など）は非公開リポジトリに置いている
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: mocula-inc/atomcam_tools-private
+          path: private
+          ssh-key: ${{ secrets.ATOMCAM_TOOLS_PRIVATE_DEPLOY_KEY }}
+          persist-credentials: false
       # 先行する実行が同じバージョンを登録し終えていることがあるため、順番が回ってきてから確かめ直す
       - name: Check registration
         id: status

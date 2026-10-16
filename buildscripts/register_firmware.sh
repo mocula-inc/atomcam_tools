@@ -15,8 +15,9 @@
 # `registered` か `unregistered` を標準出力に出す（API キー認証のみ）。
 #
 # 任意:
-#   MOCULA_API_ORIGIN      API のベースURL。省略時は cdk/config/<stage>.yml の apiOrigin
+#   MOCULA_API_ORIGIN      API のベースURL。省略時は private/config/<stage>.yml の apiOrigin
 #                          ローカル開発では http://localhost:3000 を指定する
+#   MOCULA_PRIVATE_DIR     atomcam_tools-private の場所。省略時は <repo>/private
 #   FIRMWARE_NOTE          登録時のメモ
 
 set -euo pipefail
@@ -30,7 +31,9 @@ fi
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VERSION_FILE="$REPO_ROOT/configs/mocula.ver"
-CONFIG_FILE="$REPO_ROOT/cdk/config/$STAGE.yml"
+# 環境ごとの値は非公開リポジトリ atomcam_tools-private に置く（make private で private/ に取得）
+PRIVATE_DIR=${MOCULA_PRIVATE_DIR:-$REPO_ROOT/private}
+CONFIG_FILE="$PRIVATE_DIR/config/$STAGE.yml"
 
 VERSION=$(tr -d ' \t\r\n' < "$VERSION_FILE")
 # S3 のキーになる値なので、upload_firmware.sh と同じ文字種に限る
@@ -46,6 +49,7 @@ API_ORIGIN=${MOCULA_API_ORIGIN:-}
 if [ -z "$API_ORIGIN" ]; then
   if [ ! -f "$CONFIG_FILE" ]; then
     echo "error: config not found: $CONFIG_FILE" >&2
+    echo "       Run \"make private\" to fetch atomcam_tools-private, or set MOCULA_PRIVATE_DIR." >&2
     exit 1
   fi
   API_ORIGIN=$(sed -n 's/^apiOrigin:[[:space:]]*//p' "$CONFIG_FILE" | sed 's/[[:space:]]*#.*$//; s/^"//; s/"$//' | head -1)

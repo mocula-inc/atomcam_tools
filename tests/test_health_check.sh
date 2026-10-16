@@ -316,7 +316,7 @@ origin_of() { # mconfig の中身を stdin から受け取り、origin_url の�
   ( HC_ROOT=$WORK ; . "$FUNCTIONS_FILE" ; origin_url || echo "<invalid>" )
 }
 
-check "6-1 通常" "https://qa1.mocula-dev.com" "$(printf '[global]\ntenantKey=t\norigin=https://qa1.mocula-dev.com\n' | origin_of)"
+check "6-1 通常" "https://qa.example.com" "$(printf '[global]\ntenantKey=t\norigin=https://qa.example.com\n' | origin_of)"
 check "6-2 origin 未設定なら既定値" "https://app.mocula.jp" "$(printf '[global]\ntenantKey=t\n' | origin_of)"
 check "6-3 [global] が無ければ既定値" "https://app.mocula.jp" "$(printf 'origin=https://evil.example\n' | origin_of)"
 check "6-4 別セクションの origin は拾わない" "https://app.mocula.jp" "$(printf '[global]\nt=1\n[firmware]\norigin=https://evil.example\n' | origin_of)"
