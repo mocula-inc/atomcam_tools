@@ -175,6 +175,8 @@ jobs:
             echo
             echo "- version: \`$VERSION\`（未登録）"
             echo "- commit: \`$COMMIT\`"
+            # 配置先などの設定は atomcam_tools-private の main を実行時に読むので、どのコミットの設定を使ったかを残す
+            echo "- atomcam_tools-private: \`$(git -C private rev-parse HEAD)\`"
             echo "- zip: \`$(basename "$KEY")\`"
             echo "- sha256: \`$(sha256sum atomcam_tools.zip | awk '{print $1}')\`"
           } >> "$GITHUB_STEP_SUMMARY"
