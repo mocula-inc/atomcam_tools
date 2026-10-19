@@ -1,4 +1,7 @@
-# CLAUDE.md - atomcam_tools 開発ガイド
+# AGENTS.md - atomcam_tools 開発ガイド
+
+This file provides guidance to AI coding agents (Claude Code, Codex, Antigravity, Cursor, etc.) when working with code in this repository.
+`CLAUDE.md` only imports this file; edit this file, not `CLAUDE.md`.
 
 ## プロジェクト概要
 
