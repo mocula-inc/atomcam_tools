@@ -6,6 +6,11 @@ on:
       - opened
       - synchronize
       - reopened
+    # ドキュメントだけの変更では動かさない。サブディレクトリの .md（initramfs_skeleton/README.md など）は
+    # ファームウェアに入るので、除外するのは直下の .md と docs/ だけ
+    paths-ignore:
+      - "*.md"
+      - docs/**
 
 permissions:
   contents: read
